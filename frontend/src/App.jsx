@@ -11,6 +11,7 @@ import {
 import DashboardSummary from './components/DashboardSummary'
 import StatementGrid from './components/StatementGrid'
 import SessionList from './components/SessionList'
+import CategoryRemapPage from './components/CategoryRemapPage'
 
 export default function App() {
   const [sessions, setSessions] = useState([])
@@ -20,7 +21,8 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [exporting, setExporting] = useState(false)
-  const [uploadProgress, setUploadProgress] = useState(null) // message string
+  const [uploadProgress, setUploadProgress] = useState(null)
+  const [showRemap, setShowRemap] = useState(false)
   const fileInputRef = useRef(null)
 
   // ─── Load sessions list ───────────────────────────────────────────────────
@@ -181,6 +183,17 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-50">
+      {showRemap && (
+        <CategoryRemapPage
+          onClose={() => setShowRemap(false)}
+          onRemapped={async () => {
+            // reload transactions + categories หลัง remap
+            const [catRes] = await Promise.all([getCategories()])
+            setCategories(catRes.data)
+            if (activeSessionId) await loadTransactions(activeSessionId)
+          }}
+        />
+      )}
       {/* Header */}
       <header className="bg-gray-900 text-white shadow-lg sticky top-0 z-50">
         <div className="max-w-screen-xl mx-auto px-6 py-4 flex flex-wrap items-center gap-4">
@@ -228,6 +241,14 @@ export default function App() {
                 {exporting ? <><span className="animate-spin">⟳</span> Export...</> : <><span>📥</span> Export Excel</>}
               </button>
             )}
+
+            <button
+              onClick={() => setShowRemap(true)}
+              title="จัดการ category ที่ไม่ตรงกับระบบ"
+              className="flex items-center gap-1.5 px-3 py-2 text-sm bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-lg transition-colors"
+            >
+              🔄 Remap หมวดหมู่
+            </button>
           </div>
         </div>
 

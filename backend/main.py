@@ -107,7 +107,6 @@ def bulk_update(request: schemas.BulkUpdateRequest, db: Session = Depends(get_db
     updated = crud.bulk_update_transactions(
         db, ids=request.ids, category=request.category, status=request.status
     )
-    # Update session counts for affected sessions
     session_ids = set(
         tx.session_id for tx in
         db.query(models.Transaction).filter(models.Transaction.id.in_(request.ids)).all()
@@ -115,8 +114,46 @@ def bulk_update(request: schemas.BulkUpdateRequest, db: Session = Depends(get_db
     )
     for sid in session_ids:
         crud.update_session_counts(db, sid)
-
     return {"updated_count": len(updated), "message": f"Updated {len(updated)} transactions"}
+
+
+@app.get("/api/transactions/distinct-categories", tags=["Transactions"])
+def get_distinct_categories(db: Session = Depends(get_db)):
+    """คืน list ของชื่อ category ที่มีอยู่ใน transactions จริง พร้อมจำนวน"""
+    from sqlalchemy import func as sqlfunc
+    rows = (
+        db.query(models.Transaction.category, sqlfunc.count(models.Transaction.id).label("count"))
+        .group_by(models.Transaction.category)
+        .order_by(models.Transaction.category)
+        .all()
+    )
+    return [{"category": r.category, "count": r.count} for r in rows]
+
+
+@app.post("/api/transactions/remap-category", tags=["Transactions"])
+def remap_category(body: dict, db: Session = Depends(get_db)):
+    """เปลี่ยนชื่อ category เก่า → ใหม่ ใน transactions ทั้งหมด"""
+    old_name = body.get("old_name", "").strip()
+    new_name = body.get("new_name", "").strip()
+    if not old_name or not new_name:
+        raise HTTPException(400, "old_name และ new_name ต้องไม่ว่าง")
+    updated = (
+        db.query(models.Transaction)
+        .filter(models.Transaction.category == old_name)
+        .update({"category": new_name}, synchronize_session=False)
+    )
+    db.commit()
+    # อัปเดต session counts ทุก session ที่ได้รับผลกระทบ
+    affected_sessions = (
+        db.query(models.Transaction.session_id)
+        .filter(models.Transaction.category == new_name)
+        .distinct()
+        .all()
+    )
+    for (sid,) in affected_sessions:
+        if sid:
+            crud.update_session_counts(db, sid)
+    return {"updated_count": updated, "old_name": old_name, "new_name": new_name}
 
 
 @app.put("/api/transactions/{transaction_id}", response_model=schemas.TransactionOut, tags=["Transactions"])
@@ -347,6 +384,28 @@ def _set_col_widths(ws, df):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 45)
 
 
+def _style_total_row(ws, row_idx: int, col_count: int):
+    """Style subtotal row (dark background, bold white)."""
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    total_fill = PatternFill(start_color="374151", end_color="374151", fill_type="solid")
+    total_font = Font(bold=True, color="FFFFFF", size=10)
+    med_border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="medium"), bottom=Side(style="medium"),
+    )
+    for col_idx in range(1, col_count + 1):
+        cell = ws.cell(row=row_idx, column=col_idx)
+        cell.fill = total_fill
+        cell.font = total_font
+        cell.border = med_border
+        cell.alignment = Alignment(
+            horizontal="right" if col_idx >= 5 else "left",
+            vertical="center",
+        )
+        if col_idx in (5, 6):
+            cell.number_format = '#,##0.00'
+
+
 @app.get("/api/export", tags=["Export"])
 def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -356,29 +415,51 @@ def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(
     if not transactions:
         raise HTTPException(404, "ไม่มีข้อมูลสำหรับ Export")
 
+    # ดึง category colors จาก DB เพื่อใช้ใน summary fill
+    db_cats = crud.get_categories(db)
+    db_cat_color = {c.name: c.color.lstrip("#") for c in db_cats}
+
     session_info = crud.get_session(db, session_id) if session_id else None
     filename_base = Path(session_info.filename).stem if session_info else "bank_statement"
 
     output = io.BytesIO()
 
+    # คอลัมน์ใน sheet รายการ (ลำดับสำคัญมากสำหรับ formula อ้างอิง)
+    # E=ถอน(฿), F=ฝาก(฿), H=หมวดหมู่
     COLS = ["วันที่", "รายการ", "ผ่านทาง", "เลขที่เช็ค", "ถอน (฿)", "ฝาก (฿)", "คงเหลือ (฿)", "หมวดหมู่"]
+    COL_WD  = 5   # column index (1-based) ของ ถอน (฿)
+    COL_DEP = 6   # column index ของ ฝาก (฿)
+    COL_CAT = 8   # column index ของ หมวดหมู่
 
     def tx_to_row(tx):
         return {
-            "วันที่":     tx.date,
-            "รายการ":     tx.particulars,
-            "ผ่านทาง":    tx.via,
-            "เลขที่เช็ค": tx.chq_no,
-            "ถอน (฿)":    tx.withdrawal,
-            "ฝาก (฿)":    tx.deposit,
-            "คงเหลือ (฿)":tx.balance,
-            "หมวดหมู่":   tx.category,
+            "วันที่":      tx.date,
+            "รายการ":      tx.particulars,
+            "ผ่านทาง":     tx.via,
+            "เลขที่เช็ค":  tx.chq_no,
+            "ถอน (฿)":     tx.withdrawal,
+            "ฝาก (฿)":     tx.deposit,
+            "คงเหลือ (฿)": tx.balance,
+            "หมวดหมู่":    tx.category,
         }
+
+    # helper: ชื่อ column letter
+    WD_COL  = get_column_letter(COL_WD)
+    DEP_COL = get_column_letter(COL_DEP)
+    CAT_COL = get_column_letter(COL_CAT)
+
+    def _hex_to_fill(hex6: str) -> PatternFill:
+        """สร้าง PatternFill จาก hex string 6 ตัว"""
+        return PatternFill(start_color=hex6, end_color=hex6, fill_type="solid")
+
+    def _quote_sheet(name: str) -> str:
+        """ครอบชื่อ sheet ด้วย single quote สำหรับ formula reference"""
+        return f"'{name}'"
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         wb = writer.book
 
-        # ── Sheet 1: รายการทั้งหมด ──────────────────────────────────────────
+        # ── Sheet: รายการทั้งหมด ────────────────────────────────────────────
         all_rows = [tx_to_row(tx) for tx in transactions]
         df_all = pd.DataFrame(all_rows, columns=COLS)
         df_all.to_excel(writer, index=False, sheet_name="รายการทั้งหมด")
@@ -387,48 +468,42 @@ def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(
         _style_data_rows(ws_all, transactions, len(COLS))
         _set_col_widths(ws_all, df_all)
         ws_all.freeze_panes = "A2"
+        # สูตร subtotal row ท้าย sheet รายการทั้งหมด
+        sub_row = len(transactions) + 2
+        n_data  = len(transactions)
+        ws_all.cell(sub_row, 1, "รวม").font = Font(bold=True)
+        ws_all.cell(sub_row, 2, f"{n_data} รายการ")
+        ws_all.cell(sub_row, COL_WD,  f"=SUM({WD_COL}2:{WD_COL}{sub_row-1})")
+        ws_all.cell(sub_row, COL_DEP, f"=SUM({DEP_COL}2:{DEP_COL}{sub_row-1})")
+        _style_total_row(ws_all, sub_row, len(COLS))
 
         # ── Sheets per category group ────────────────────────────────────────
-        # Build a map: category_name → list of transactions
         cat_map: dict[str, list] = {}
         for tx in transactions:
             cat_map.setdefault(tx.category, []).append(tx)
 
-        # Also collect custom categories not in EXPORT_SHEET_MAP
         covered_cats = set()
         for _, cats in EXPORT_SHEET_MAP:
             covered_cats.update(cats)
-
         extra_cats = [c for c in cat_map if c not in covered_cats]
 
-        # Build full sheet list: predefined + extras
         sheet_list = list(EXPORT_SHEET_MAP)
         for cat in extra_cats:
-            sheet_list.append((cat[:31], [cat]))  # sheet name max 31 chars
+            sheet_list.append((cat[:31], [cat]))
+
+        # เก็บ mapping sheet_name → (list_of_category_names, data_row_count)
+        # สำหรับใช้สร้าง formula ใน summary sheet
+        sheet_meta: dict[str, dict] = {}
 
         for sheet_name, cat_names in sheet_list:
             group_txs = []
             for cat in cat_names:
                 group_txs.extend(cat_map.get(cat, []))
-
             if not group_txs:
-                continue  # skip empty sheets
+                continue
 
             rows = [tx_to_row(tx) for tx in group_txs]
             df_g = pd.DataFrame(rows, columns=COLS)
-
-            # Add subtotal row
-            subtotal = {
-                "วันที่":     "รวม",
-                "รายการ":     f"{len(group_txs)} รายการ",
-                "ผ่านทาง":    None,
-                "เลขที่เช็ค": None,
-                "ถอน (฿)":    df_g["ถอน (฿)"].sum(),
-                "ฝาก (฿)":    df_g["ฝาก (฿)"].sum(),
-                "คงเหลือ (฿)":None,
-                "หมวดหมู่":   None,
-            }
-            df_g = pd.concat([df_g, pd.DataFrame([subtotal])], ignore_index=True)
             df_g.to_excel(writer, index=False, sheet_name=sheet_name)
 
             ws = writer.sheets[sheet_name]
@@ -437,33 +512,37 @@ def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(
             _set_col_widths(ws, df_g)
             ws.freeze_panes = "A2"
 
-            # Style subtotal row
-            total_row_idx = len(group_txs) + 2
-            total_fill = PatternFill(start_color="374151", end_color="374151", fill_type="solid")
-            total_font = Font(bold=True, color="FFFFFF", size=10)
-            thin = Border(
-                left=Side(style="thin"), right=Side(style="thin"),
-                top=Side(style="medium"), bottom=Side(style="medium"),
-            )
-            for col_idx in range(1, len(COLS) + 1):
-                cell = ws.cell(row=total_row_idx, column=col_idx)
-                cell.fill = total_fill
-                cell.font = total_font
-                cell.border = thin
-                cell.alignment = Alignment(horizontal="right" if col_idx >= 5 else "left", vertical="center")
+            # subtotal row ด้วย SUM formula
+            sub_r = len(group_txs) + 2
+            ws.cell(sub_r, 1, "รวม").font = Font(bold=True)
+            ws.cell(sub_r, 2, f"{len(group_txs)} รายการ")
+            ws.cell(sub_r, COL_WD,  f"=SUM({WD_COL}2:{WD_COL}{sub_r-1})")
+            ws.cell(sub_r, COL_DEP, f"=SUM({DEP_COL}2:{DEP_COL}{sub_r-1})")
+            _style_total_row(ws, sub_r, len(COLS))
 
-        # ── Summary sheet ────────────────────────────────────────────────────
+            sheet_meta[sheet_name] = {
+                "cat_names": cat_names,
+                "data_rows": len(group_txs),
+                "sub_row":   sub_r,
+            }
+
+        # ── Summary sheet (formula-based) ────────────────────────────────────
         ws_s = wb.create_sheet("สรุปยอดรวม")
+
+        thin = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin"),
+        )
 
         # Account info block
         row = 1
         if session_info:
             info_rows = [
-                ("ไฟล์ต้นฉบับ",  session_info.filename),
-                ("เลขบัญชี",     session_info.account_number or "-"),
-                ("ชื่อบัญชี",    session_info.account_name   or "-"),
-                ("ธนาคาร",       session_info.bank_name      or "-"),
-                ("ช่วงเวลา",     f"{session_info.period_start} – {session_info.period_end}"),
+                ("ไฟล์ต้นฉบับ", session_info.filename),
+                ("เลขบัญชี",    session_info.account_number or "-"),
+                ("ชื่อบัญชี",   session_info.account_name   or "-"),
+                ("ธนาคาร",      session_info.bank_name      or "-"),
+                ("ช่วงเวลา",    f"{session_info.period_start} – {session_info.period_end}"),
             ]
             for label, val in info_rows:
                 ws_s.cell(row=row, column=1, value=label).font = Font(bold=True, size=10)
@@ -471,25 +550,20 @@ def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(
                 row += 1
             row += 1  # blank line
 
-        # Summary table header
+        # Header row
         sum_headers = ["หมวดหมู่", "จำนวนรายการ", "ยอดถอนรวม (฿)", "ยอดฝากรวม (฿)", "สุทธิ (฿)"]
+        hdr_fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
         for col_idx, h in enumerate(sum_headers, 1):
             cell = ws_s.cell(row=row, column=col_idx, value=h)
-            cell.fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
+            cell.fill = hdr_fill
             cell.font = Font(bold=True, color="FFFFFF", size=10)
             cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = Border(
-                left=Side(style="thin"), right=Side(style="thin"),
-                top=Side(style="thin"), bottom=Side(style="thin"),
-            )
+            cell.border = thin
         ws_s.row_dimensions[row].height = 24
+        header_row = row
         row += 1
 
-        # Per-category rows
-        total_wd = total_dep = 0.0
-        all_cat_names = list(cat_map.keys())
-
-        # Order: predefined first, then extras
+        # Build ordered category list (same order as before)
         ordered = []
         seen = set()
         for _, cats in EXPORT_SHEET_MAP:
@@ -497,63 +571,108 @@ def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(
                 if c in cat_map and c not in seen:
                     ordered.append(c)
                     seen.add(c)
-        for c in all_cat_names:
+        for c in cat_map:
             if c not in seen:
                 ordered.append(c)
 
-        thin = Border(
-            left=Side(style="thin"), right=Side(style="thin"),
-            top=Side(style="thin"), bottom=Side(style="thin"),
-        )
+        # data_row_start ใน summary (สำหรับ SUM formula grand total)
+        data_start_row = row
+        cat_row_map: dict[str, int] = {}   # category → row ใน summary
 
         for cat in ordered:
-            txs = cat_map.get(cat, [])
-            wd  = sum(t.withdrawal or 0 for t in txs)
-            dep = sum(t.deposit    or 0 for t in txs)
-            net = dep - wd
-            total_wd  += wd
-            total_dep += dep
+            # หา sheet ที่ cat อยู่
+            target_sheet = None
+            for sname, meta in sheet_meta.items():
+                if cat in meta["cat_names"]:
+                    target_sheet = sname
+                    break
 
-            fill_hex = CATEGORY_FILL_COLORS.get(cat, "FFFFFF")
-            row_fill = PatternFill(start_color=fill_hex, end_color=fill_hex, fill_type="solid")
+            ref = _quote_sheet(target_sheet) if target_sheet else None
+            n_txs = len(cat_map.get(cat, []))
 
-            vals = [cat, len(txs), wd if wd else None, dep if dep else None, net if net != 0 else None]
-            for col_idx, val in enumerate(vals, 1):
-                cell = ws_s.cell(row=row, column=col_idx, value=val)
+            # สร้าง formula อ้างอิงไป sheet นั้น
+            # SUMIF เพื่อกันบรรทัด subtotal "รวม" ไม่ให้นับ
+            if ref and target_sheet:
+                sub_r = sheet_meta[target_sheet]["sub_row"]
+                data_end = sub_r - 1
+                wd_formula  = f"=SUMIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},{_quote_sheet(cat)},{ref}!{WD_COL}2:{WD_COL}{data_end})"
+                dep_formula = f"=SUMIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},{_quote_sheet(cat)},{ref}!{DEP_COL}2:{DEP_COL}{data_end})"
+                # COUNTIF สำหรับจำนวนรายการ
+                cnt_formula = f"=COUNTIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},{_quote_sheet(cat)})"
+            else:
+                # fallback hardcode ถ้าไม่มี sheet
+                txs = cat_map.get(cat, [])
+                wd_formula  = sum(t.withdrawal or 0 for t in txs)
+                dep_formula = sum(t.deposit    or 0 for t in txs)
+                cnt_formula = n_txs
+
+            cat_col_letter = "C"   # ยอดถอน
+            dep_col_letter = "D"   # ยอดฝาก
+
+            # fill สี
+            hex6 = db_cat_color.get(cat, CATEGORY_FILL_COLORS.get(cat, "FFFFFF"))
+            row_fill = _hex_to_fill(hex6)
+
+            # เขียน row
+            for col_idx in range(1, 6):
+                cell = ws_s.cell(row=row, column=col_idx)
                 cell.fill = row_fill
                 cell.border = thin
                 cell.alignment = Alignment(
                     horizontal="right" if col_idx >= 2 else "left",
                     vertical="center",
                 )
-                if col_idx >= 3 and val is not None:
-                    cell.number_format = '#,##0.00'
+
+            ws_s.cell(row=row, column=1, value=cat)
+            ws_s.cell(row=row, column=2, value=cnt_formula)
+            ws_s.cell(row=row, column=3, value=wd_formula)
+            ws_s.cell(row=row, column=4, value=dep_formula)
+            # สุทธิ = ฝาก - ถอน (formula อ้างอิงเซลล์เดียวกัน)
+            ws_s.cell(row=row, column=5, value=f"=D{row}-C{row}")
+
+            # format number
+            for col_idx in [3, 4, 5]:
+                ws_s.cell(row=row, column=col_idx).number_format = '#,##0.00'
+
+            cat_row_map[cat] = row
             row += 1
 
-        # Grand total row
+        data_end_row = row - 1
+
+        # Grand total row — SUM formula รวม rows ด้านบน
         grand_fill = PatternFill(start_color="111827", end_color="111827", fill_type="solid")
         grand_font = Font(bold=True, color="FFFFFF", size=10)
-        grand_vals = ["รวมทั้งหมด", len(transactions), total_wd, total_dep, total_dep - total_wd]
-        for col_idx, val in enumerate(grand_vals, 1):
+        grand_border = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="medium"), bottom=Side(style="medium"),
+        )
+        grand_data = [
+            ("รวมทั้งหมด",          None),
+            (f"=SUM(B{data_start_row}:B{data_end_row})", None),
+            (f"=SUM(C{data_start_row}:C{data_end_row})", '#,##0.00'),
+            (f"=SUM(D{data_start_row}:D{data_end_row})", '#,##0.00'),
+            (f"=D{row}-C{row}",                          '#,##0.00'),
+        ]
+        for col_idx, (val, fmt) in enumerate(grand_data, 1):
             cell = ws_s.cell(row=row, column=col_idx, value=val)
             cell.fill = grand_fill
             cell.font = grand_font
-            cell.border = Border(
-                left=Side(style="thin"), right=Side(style="thin"),
-                top=Side(style="medium"), bottom=Side(style="medium"),
+            cell.border = grand_border
+            cell.alignment = Alignment(
+                horizontal="right" if col_idx >= 2 else "left",
+                vertical="center",
             )
-            cell.alignment = Alignment(horizontal="right" if col_idx >= 2 else "left", vertical="center")
-            if col_idx >= 3:
-                cell.number_format = '#,##0.00'
+            if fmt:
+                cell.number_format = fmt
 
-        # Column widths for summary sheet
+        # Column widths
         ws_s.column_dimensions["A"].width = 28
         ws_s.column_dimensions["B"].width = 15
         ws_s.column_dimensions["C"].width = 20
         ws_s.column_dimensions["D"].width = 20
         ws_s.column_dimensions["E"].width = 20
 
-        # Move summary sheet to front
+        # Move summary to front
         wb.move_sheet("สรุปยอดรวม", offset=-len(wb.sheetnames) + 1)
 
     output.seek(0)

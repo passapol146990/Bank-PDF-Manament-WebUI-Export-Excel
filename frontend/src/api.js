@@ -48,4 +48,9 @@ export const updateCategory = (id, data) => api.put(`/categories/${id}`, data)
 export const deleteCategory = (id) => api.delete(`/categories/${id}`)
 export const reorderCategories = (items) => api.put('/categories/reorder', { items })
 
+// ─── Category Remap ───────────────────────────────────────────────────────────
+export const getDistinctCategories = () => api.get('/transactions/distinct-categories')
+export const remapCategory = (oldName, newName) =>
+  api.post('/transactions/remap-category', { old_name: oldName, new_name: newName })
+
 export default api

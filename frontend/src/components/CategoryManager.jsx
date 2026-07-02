@@ -118,22 +118,28 @@ function CategoryRow({ cat, isDragging, dragHandleProps, onEdit, onDelete, isPro
 }
 
 // ─── Main CategoryManager Modal ───────────────────────────────────────────────
-export default function CategoryManager({ categories, onCategoriesUpdate, onClose }) {
+export default function CategoryManager({ categories, onCategoriesUpdate, onClose, keyBindings = {}, onKeyBindingsChange }) {
   const [items, setItems]         = useState([...categories].sort((a, b) => a.sort_order - b.sort_order))
   const [newName, setNewName]     = useState('')
   const [newColor, setNewColor]   = useState('#6B7280')
   const [newDesc, setNewDesc]     = useState('')
   const [saving, setSaving]       = useState(false)
+  const [activeTab, setActiveTab] = useState('categories')  // 'categories' | 'shortcuts'
+
+  // local copy ของ bindings ที่กำลังแก้ไข
+  const [localBindings, setLocalBindings] = useState({ ...keyBindings })
 
   // ── Drag state ────────────────────────────────────────────────────────────
   const dragIndex   = useRef(null)
   const dragOverIdx = useRef(null)
   const [draggingId, setDraggingId] = useState(null)
 
-  // Keep local items in sync if parent updates (e.g. after optimistic update)
   useEffect(() => {
     setItems([...categories].sort((a, b) => a.sort_order - b.sort_order))
   }, [categories])
+
+  // sync localBindings เมื่อ parent เปลี่ยน
+  useEffect(() => { setLocalBindings({ ...keyBindings }) }, [keyBindings])
 
   // ── Add new category ──────────────────────────────────────────────────────
   const handleAdd = async (e) => {
@@ -226,6 +232,31 @@ export default function CategoryManager({ categories, onCategoriesUpdate, onClos
   // Protected = ลบไม่ได้ (Uncategorized)
   const PROTECTED = ['Uncategorized']
 
+  // ── Shortcut binding handlers ─────────────────────────────────────────────
+  const handleBindingChange = (key, catName) => {
+    setLocalBindings(prev => {
+      const next = { ...prev }
+      if (!catName) delete next[key]
+      else next[key] = catName
+      return next
+    })
+  }
+  const handleSaveBindings = () => {
+    onKeyBindingsChange?.(localBindings)
+    toast.success('บันทึกปุ่มลัดแล้ว', { duration: 3000 })
+  }
+  const handleClearBindings = () => {
+    setLocalBindings({})
+    onKeyBindingsChange?.({})
+    toast('ล้างปุ่มลัดแล้ว', { icon: '🗑️', duration: 3000 })
+  }
+  // คืนชื่อ cat ที่ key นี้ถูกผูกไว้ (ไม่นับ key ปัจจุบัน) — ป้องกัน duplicate
+  const getConflict = (key, catName) => {
+    if (!catName) return null
+    const conflict = Object.entries(localBindings).find(([k, v]) => k !== key && v === catName)
+    return conflict ? conflict[0] : null
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={onClose}>
       <div
@@ -236,14 +267,26 @@ export default function CategoryManager({ categories, onCategoriesUpdate, onClos
         <div className="flex items-center justify-between px-5 py-4 bg-white border-b border-gray-200">
           <div>
             <h2 className="text-base font-bold text-gray-800">🗂️ จัดการหมวดหมู่</h2>
-            <p className="text-xs text-gray-400 mt-0.5">ลากเพื่อเรียงลำดับ · คลิก แก้ไข เพื่อเปลี่ยนชื่อ/สี</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              {activeTab === 'categories' ? 'ลากเพื่อเรียงลำดับ · คลิก แก้ไข เพื่อเปลี่ยนชื่อ/สี' : 'กำหนดปุ่ม 1–9 ให้หมวดหมู่ที่ใช้บ่อย'}
+            </p>
           </div>
-          <button onClick={onClose}
-            className="p-2 hover:bg-gray-100 rounded-xl text-gray-400 hover:text-gray-600 transition-colors">
-            ✕
-          </button>
+          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-xl text-gray-400 hover:text-gray-600 transition-colors">✕</button>
         </div>
 
+        {/* Tabs */}
+        <div className="flex border-b border-gray-200 bg-white shrink-0">
+          {[['categories', '📋 หมวดหมู่'], ['shortcuts', '⌨️ ปุ่มลัด']].map(([id, label]) => (
+            <button key={id} onClick={() => setActiveTab(id)}
+              className={`px-5 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px
+                ${activeTab === id ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* Tab: หมวดหมู่ */}
+        {activeTab === 'categories' && (<>
         {/* List */}
         <div className="flex-1 overflow-y-auto p-4 space-y-2">
           {items.length === 0 && (
@@ -304,6 +347,72 @@ export default function CategoryManager({ categories, onCategoriesUpdate, onClos
             </div>
           </form>
         </div>
+        </>)}
+
+        {/* Tab: ปุ่มลัด */}
+        {activeTab === 'shortcuts' && (
+          <div className="flex-1 overflow-y-auto flex flex-col">
+            <div className="flex-1 p-4 space-y-2">
+              <p className="text-xs text-gray-500 mb-3">
+                กำหนดปุ่ม <kbd className="font-mono bg-gray-100 border border-gray-300 rounded px-1">1</kbd>–<kbd className="font-mono bg-gray-100 border border-gray-300 rounded px-1">9</kbd> ให้หมวดหมู่ที่ต้องการ
+                · ปล่อยว่างเพื่อไม่ผูกปุ่มนั้น · แต่ละหมวดหมู่ใช้ได้แค่ 1 ปุ่ม
+              </p>
+              {Array.from({ length: 9 }, (_, i) => String(i + 1)).map(key => {
+                const bound   = localBindings[key] || ''
+                const conflict = bound ? getConflict(key, bound) : null
+                return (
+                  <div key={key} className="flex items-center gap-3 bg-white rounded-xl border border-gray-200 px-3 py-2.5">
+                    {/* Key badge */}
+                    <kbd className="shrink-0 w-8 h-8 flex items-center justify-center font-mono font-bold text-sm bg-gray-800 text-white rounded-lg shadow-sm">
+                      {key}
+                    </kbd>
+                    {/* Category selector */}
+                    <select
+                      value={bound}
+                      onChange={e => handleBindingChange(key, e.target.value)}
+                      className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-300 bg-white"
+                    >
+                      <option value="">— ไม่ผูกปุ่มนี้ —</option>
+                      {items.filter(c => c.name !== 'Uncategorized').map(c => (
+                        <option key={c.id} value={c.name}>{c.name}</option>
+                      ))}
+                    </select>
+                    {/* Color dot */}
+                    {bound && (() => {
+                      const cat = items.find(c => c.name === bound)
+                      return cat ? (
+                        <span className="shrink-0 w-4 h-4 rounded-full border border-white shadow"
+                          style={{ backgroundColor: cat.color }} />
+                      ) : null
+                    })()}
+                    {/* Conflict warning */}
+                    {conflict && (
+                      <span className="text-xs text-amber-600 shrink-0" title={`หมวดหมู่นี้ถูกผูกกับปุ่ม ${conflict} แล้ว`}>
+                        ⚠️ ซ้ำ {conflict}
+                      </span>
+                    )}
+                    {/* Clear button */}
+                    {bound && (
+                      <button onClick={() => handleBindingChange(key, '')}
+                        className="shrink-0 text-gray-300 hover:text-red-400 transition-colors text-sm" title="ล้าง">✕</button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            {/* Footer actions */}
+            <div className="border-t border-gray-200 bg-white px-4 py-3 flex items-center gap-2">
+              <button onClick={handleSaveBindings}
+                className="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors">
+                💾 บันทึกปุ่มลัด
+              </button>
+              <button onClick={handleClearBindings}
+                className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm rounded-lg transition-colors">
+                ล้างทั้งหมด
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
