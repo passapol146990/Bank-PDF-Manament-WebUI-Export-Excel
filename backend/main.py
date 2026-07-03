@@ -379,8 +379,13 @@ def _style_data_rows(ws, transactions_slice, col_count: int, fill_hex: str = Non
 def _set_col_widths(ws, df):
     from openpyxl.utils import get_column_letter
     for col_idx, col_name in enumerate(df.columns, start=1):
-        col_data = df.iloc[:, col_idx - 1].astype(str)
-        max_len = max(len(str(col_name)), col_data.map(len).max() if len(df) > 0 else 0)
+        col_data = df.iloc[:, col_idx - 1]
+        try:
+            str_lens = col_data.apply(lambda x: len(str(x)) if x is not None and str(x) != 'nan' else 0)
+            max_data_len = int(str_lens.max()) if len(str_lens) > 0 else 0
+        except Exception:
+            max_data_len = 0
+        max_len = max(len(str(col_name)), max_data_len)
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 45)
 
 
@@ -595,10 +600,11 @@ def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(
             if ref and target_sheet:
                 sub_r = sheet_meta[target_sheet]["sub_row"]
                 data_end = sub_r - 1
-                wd_formula  = f"=SUMIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},{_quote_sheet(cat)},{ref}!{WD_COL}2:{WD_COL}{data_end})"
-                dep_formula = f"=SUMIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},{_quote_sheet(cat)},{ref}!{DEP_COL}2:{DEP_COL}{data_end})"
-                # COUNTIF สำหรับจำนวนรายการ
-                cnt_formula = f"=COUNTIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},{_quote_sheet(cat)})"
+                # criteria ใน SUMIF/COUNTIF ต้องใช้ double quote ครอบชื่อหมวดหมู่
+                cat_escaped = cat.replace('"', '""')   # escape double quote ในชื่อ
+                wd_formula  = f'=SUMIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},"{cat_escaped}",{ref}!{WD_COL}2:{WD_COL}{data_end})'
+                dep_formula = f'=SUMIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},"{cat_escaped}",{ref}!{DEP_COL}2:{DEP_COL}{data_end})'
+                cnt_formula = f'=COUNTIF({ref}!{CAT_COL}2:{CAT_COL}{data_end},"{cat_escaped}")'
             else:
                 # fallback hardcode ถ้าไม่มี sheet
                 txs = cat_map.get(cat, [])
