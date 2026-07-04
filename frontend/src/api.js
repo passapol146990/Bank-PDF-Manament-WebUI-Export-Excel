@@ -12,8 +12,12 @@ export const getSessions = () => api.get('/sessions')
 export const deleteSession = (id) => api.delete(`/sessions/${id}`)
 
 // ─── Transactions ─────────────────────────────────────────────────────────────
-export const getTransactions = (sessionId = null) =>
-  api.get('/transactions', { params: sessionId ? { session_id: sessionId } : {} })
+export const getTransactions = (sessionId = null, sessionIds = null) => {
+  const params = {}
+  if (sessionIds && sessionIds.length > 0) params.session_ids = sessionIds.join(',')
+  else if (sessionId) params.session_id = sessionId
+  return api.get('/transactions', { params })
+}
 
 export const updateTransaction = (id, data) => api.put(`/transactions/${id}`, data)
 
@@ -22,24 +26,33 @@ export const bulkUpdateTransactions = (ids, category) =>
 
 export const deleteAllTransactions = () => api.delete('/transactions')
 
-export const getStats = (sessionId = null) =>
-  api.get('/transactions/stats', { params: sessionId ? { session_id: sessionId } : {} })
+export const getStats = (sessionId = null, sessionIds = null) => {
+  const params = {}
+  if (sessionIds && sessionIds.length > 0) params.session_ids = sessionIds.join(',')
+  else if (sessionId) params.session_id = sessionId
+  return api.get('/transactions/stats', { params })
+}
 
-export const getCategorySummary = (sessionId = null) =>
-  api.get('/transactions/category-summary', { params: sessionId ? { session_id: sessionId } : {} })
+export const getCategorySummary = (sessionId = null, sessionIds = null) => {
+  const params = {}
+  if (sessionIds && sessionIds.length > 0) params.session_ids = sessionIds.join(',')
+  else if (sessionId) params.session_id = sessionId
+  return api.get('/transactions/category-summary', { params })
+}
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
-export const uploadFile = (formData) =>
-  api.post('/upload', formData, {
+export const uploadFile = (formData, bank = 'ktb') =>
+  api.post(`/upload?bank=${bank}`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   })
 
 // ─── Export ───────────────────────────────────────────────────────────────────
-export const exportExcel = (sessionId = null) =>
-  api.get('/export', {
-    responseType: 'blob',
-    params: sessionId ? { session_id: sessionId } : {},
-  })
+export const exportExcel = (sessionId = null, sessionIds = null) => {
+  const params = {}
+  if (sessionIds && sessionIds.length > 0) params.session_ids = sessionIds.join(',')
+  else if (sessionId) params.session_id = sessionId
+  return api.get('/export', { responseType: 'blob', params })
+}
 
 // ─── Categories ───────────────────────────────────────────────────────────────
 export const getCategories = () => api.get('/categories')

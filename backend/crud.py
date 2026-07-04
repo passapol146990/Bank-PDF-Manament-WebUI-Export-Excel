@@ -68,9 +68,11 @@ def delete_session(db: Session, session_id: int):
 
 # ─── Transaction CRUD ────────────────────────────────────────────────────────
 
-def get_transactions(db: Session, session_id: int = None, skip: int = 0, limit: int = 50000):
+def get_transactions(db: Session, session_id: int = None, session_ids: list = None, skip: int = 0, limit: int = 50000):
     q = db.query(models.Transaction)
-    if session_id is not None:
+    if session_ids:
+        q = q.filter(models.Transaction.session_id.in_(session_ids))
+    elif session_id is not None:
         q = q.filter(models.Transaction.session_id == session_id)
     return q.order_by(models.Transaction.id).offset(skip).limit(limit).all()
 
@@ -115,9 +117,11 @@ def delete_all_transactions(db: Session):
     db.commit()
 
 
-def get_transaction_stats(db: Session, session_id: int = None):
+def get_transaction_stats(db: Session, session_id: int = None, session_ids: list = None):
     q_base = db.query(models.Transaction)
-    if session_id:
+    if session_ids:
+        q_base = q_base.filter(models.Transaction.session_id.in_(session_ids))
+    elif session_id:
         q_base = q_base.filter(models.Transaction.session_id == session_id)
 
     total = q_base.with_entities(func.count(models.Transaction.id)).scalar() or 0
@@ -147,14 +151,16 @@ def get_transaction_stats(db: Session, session_id: int = None):
     }
 
 
-def get_category_summary(db: Session, session_id: int = None):
+def get_category_summary(db: Session, session_id: int = None, session_ids: list = None):
     q = db.query(
         models.Transaction.category,
         func.count(models.Transaction.id).label("count"),
         func.sum(models.Transaction.withdrawal).label("total_withdrawal"),
         func.sum(models.Transaction.deposit).label("total_deposit"),
     )
-    if session_id:
+    if session_ids:
+        q = q.filter(models.Transaction.session_id.in_(session_ids))
+    elif session_id:
         q = q.filter(models.Transaction.session_id == session_id)
     results = q.group_by(models.Transaction.category).all()
 

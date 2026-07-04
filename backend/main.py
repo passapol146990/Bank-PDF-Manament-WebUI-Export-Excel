@@ -20,6 +20,7 @@ import models
 import schemas
 from database import engine, get_db, run_migrations
 from pdf_parser import parse_ktb_pdf
+from ttb_parser import parse_ttb_pdf
 
 # ─── App Setup ───────────────────────────────────────────────────────────────
 
@@ -85,11 +86,15 @@ def delete_session(session_id: int, db: Session = Depends(get_db)):
 @app.get("/api/transactions", response_model=List[schemas.TransactionOut], tags=["Transactions"])
 def get_transactions(
     session_id: Optional[int] = Query(None),
+    session_ids: Optional[str] = Query(None),  # comma-separated: "1,2,3"
     skip: int = Query(0, ge=0),
     limit: int = Query(50000, ge=1),
     db: Session = Depends(get_db),
 ):
-    return crud.get_transactions(db, session_id=session_id, skip=skip, limit=limit)
+    ids = None
+    if session_ids:
+        ids = [int(x) for x in session_ids.split(",") if x.strip().isdigit()]
+    return crud.get_transactions(db, session_id=session_id, session_ids=ids, skip=skip, limit=limit)
 
 
 @app.get("/api/transactions/stats", tags=["Transactions"])
@@ -179,25 +184,28 @@ def delete_all(db: Session = Depends(get_db)):
 # ─── Upload PDF ───────────────────────────────────────────────────────────────
 
 @app.post("/api/upload", tags=["Upload"])
-async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_file(
+    file: UploadFile = File(...),
+    bank: str = Query("ktb", description="ktb | ttb"),
+    db: Session = Depends(get_db)
+):
     filename = file.filename or ""
     ext = Path(filename).suffix.lower()
 
-    if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
-        raise HTTPException(400, "Supported formats: PDF, Excel (.xlsx/.xls), CSV")
+    if ext not in (".pdf", ".xlsx", ".xls", ".csv", ".json"):
+        raise HTTPException(400, "Supported formats: PDF, Excel (.xlsx/.xls), CSV, JSON")
 
     contents = await file.read()
 
     if ext == ".pdf":
-        return await _handle_pdf_upload(contents, filename, db)
+        return await _handle_pdf_upload(contents, filename, db, bank=bank)
+    elif ext == ".json":
+        return await _handle_json_upload(contents, filename, db)
     else:
         return await _handle_excel_upload(contents, filename, ext, db)
 
 
-async def _handle_pdf_upload(contents: bytes, filename: str, db: Session):
-    """Parse PDF and import transactions."""
-    # Check for duplicate by file hash
-    from pdf_parser import parse_ktb_pdf
+async def _handle_pdf_upload(contents: bytes, filename: str, db: Session, bank: str = "ktb"):
     import hashlib
     file_hash = hashlib.md5(contents).hexdigest()
 
@@ -211,7 +219,10 @@ async def _handle_pdf_upload(contents: bytes, filename: str, db: Session):
         }
 
     try:
-        statement = parse_ktb_pdf(contents, filename)
+        if bank == "ttb":
+            statement = parse_ttb_pdf(contents, filename)
+        else:
+            statement = parse_ktb_pdf(contents, filename)
     except Exception as e:
         raise HTTPException(400, f"ไม่สามารถอ่าน PDF ได้: {str(e)}")
 
@@ -259,8 +270,134 @@ async def _handle_pdf_upload(contents: bytes, filename: str, db: Session):
     }
 
 
-COLUMN_ALIASES = {
-    "date": "date", "วันที่": "date",
+async def _handle_json_upload(contents: bytes, filename: str, db: Session):
+    """Parse JSON array and import transactions.
+
+    รองรับ format:
+    [
+      {
+        "date": "13/05/24",          ← DD/MM/YY หรือ DD/MM/YYYY
+        "tx_amount": "373.00",       ← จำนวนเงิน (บวก = ฝาก, ลบ = ถอน)
+        "balance": "6,751.57",
+        "detail": "TR 9906901",      ← รายละเอียดรายการ
+        "category": "ลูกค้าโอนให้"   ← optional: เก็บไว้ตามที่มีแม้ไม่อยู่ใน DB
+      },
+      ...
+    ]
+    """
+    import json
+    import hashlib
+
+    file_hash = hashlib.md5(contents).hexdigest()
+
+    # ตรวจซ้ำ
+    existing = crud.get_session_by_hash(db, file_hash)
+    if existing:
+        return {
+            "message": f"ไฟล์นี้เคยนำเข้าแล้ว (session #{existing.id}) — กำลังโหลดข้อมูลเดิม",
+            "session_id": existing.id,
+            "count": existing.total_rows,
+            "is_duplicate": True,
+        }
+
+    try:
+        data = json.loads(contents.decode("utf-8-sig"))
+    except Exception as e:
+        raise HTTPException(400, f"อ่าน JSON ไม่ได้: {str(e)}")
+
+    if not isinstance(data, list):
+        raise HTTPException(400, "ไฟล์ JSON ต้องเป็น array ของ object")
+
+    if len(data) == 0:
+        raise HTTPException(400, "ไม่พบข้อมูลใน JSON")
+
+    def clean_number(v) -> Optional[float]:
+        """แปลง '6,751.57' หรือ '-373.00' → float"""
+        if v is None:
+            return None
+        try:
+            return float(str(v).replace(",", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    def parse_date_sort_key(date_str: str) -> str:
+        """แปลง DD/MM/YY หรือ DD/MM/YYYY → YYYY-MM-DD สำหรับเรียงลำดับ"""
+        if not date_str:
+            return ""
+        parts = date_str.strip().split("/")
+        if len(parts) == 3:
+            day, month, year = parts
+            # DD/MM/YY → เติม 20xx
+            if len(year) == 2:
+                year = "20" + year
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+        return date_str
+
+    session = crud.create_session(db, filename=filename, file_hash=file_hash)
+
+    # เรียงข้อมูลตามวันที่ก่อน import
+    try:
+        data = sorted(data, key=lambda r: parse_date_sort_key(str(r.get("date", ""))))
+    except Exception:
+        pass  # ถ้าเรียงไม่ได้ ใช้ลำดับเดิม
+
+    transactions = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+
+        # รองรับทั้ง "detail" และ "particulars"
+        particulars = row.get("detail") or row.get("particulars") or row.get("description")
+
+        # tx_amount: ถ้าเป็นบวก = ฝาก, ถ้าเป็นลบ = ถอน
+        raw_amount = clean_number(row.get("tx_amount") or row.get("amount"))
+        withdrawal = None
+        deposit = None
+        if raw_amount is not None:
+            if raw_amount < 0:
+                withdrawal = abs(raw_amount)
+            else:
+                deposit = raw_amount
+
+        # รองรับ withdrawal/deposit แยกกัน (ถ้ามี)
+        if row.get("withdrawal") is not None:
+            withdrawal = clean_number(row.get("withdrawal"))
+        if row.get("deposit") is not None:
+            deposit = clean_number(row.get("deposit"))
+
+        # เก็บ category ตามที่มีใน JSON เลย ไม่ fallback เป็น Uncategorized
+        # เพื่อให้ผู้ใช้เห็นข้อมูลจริงและ remap ได้ภายหลัง
+        category = str(row.get("category", "")).strip() or "Uncategorized"
+
+        tx = schemas.TransactionCreate(
+            session_id=session.id,
+            date=str(row.get("date", "")).strip() or None,
+            particulars=str(particulars).strip() if particulars else None,
+            chq_no=str(row.get("chq_no", "")).strip() or None,
+            withdrawal=withdrawal,
+            deposit=deposit,
+            balance=clean_number(row.get("balance")),
+            via=str(row.get("via", "")).strip() or None,
+            category=category,
+        )
+        transactions.append(tx)
+
+    if not transactions:
+        crud.delete_session(db, session.id)
+        raise HTTPException(400, "ไม่พบข้อมูลรายการใน JSON ที่สามารถนำเข้าได้")
+
+    crud.bulk_create_transactions(db, transactions)
+    crud.update_session_counts(db, session.id)
+
+    return {
+        "message": f"นำเข้า {len(transactions)} รายการจาก {filename} สำเร็จ",
+        "session_id": session.id,
+        "count": len(transactions),
+        "is_duplicate": False,
+    }
+
+
+COLUMN_ALIASES = {    "date": "date", "วันที่": "date",
     "particulars": "particulars", "รายการ": "particulars", "description": "particulars",
     "withdrawal": "withdrawal", "ถอน": "withdrawal", "debit": "withdrawal",
     "deposit": "deposit", "ฝาก": "deposit", "credit": "deposit",
@@ -412,20 +549,36 @@ def _style_total_row(ws, row_idx: int, col_count: int):
 
 
 @app.get("/api/export", tags=["Export"])
-def export_excel(session_id: Optional[int] = Query(None), db: Session = Depends(get_db)):
+def export_excel(
+    session_id: Optional[int] = Query(None),
+    session_ids: Optional[str] = Query(None),  # comma-separated: "1,2,3"
+    db: Session = Depends(get_db)
+):
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
-    transactions = crud.get_transactions(db, session_id=session_id)
+    ids = None
+    if session_ids:
+        ids = [int(x) for x in session_ids.split(",") if x.strip().isdigit()]
+
+    transactions = crud.get_transactions(db, session_id=session_id, session_ids=ids)
     if not transactions:
         raise HTTPException(404, "ไม่มีข้อมูลสำหรับ Export")
 
-    # ดึง category colors จาก DB เพื่อใช้ใน summary fill
     db_cats = crud.get_categories(db)
     db_cat_color = {c.name: c.color.lstrip("#") for c in db_cats}
 
-    session_info = crud.get_session(db, session_id) if session_id else None
-    filename_base = Path(session_info.filename).stem if session_info else "bank_statement"
+    # ถ้าเลือกหลาย session ให้ชื่อไฟล์เป็น combined
+    if ids and len(ids) > 1:
+        filename_base = f"combined_{len(ids)}_files"
+    elif session_id:
+        session_info = crud.get_session(db, session_id)
+        filename_base = Path(session_info.filename).stem if session_info else "bank_statement"
+    elif ids and len(ids) == 1:
+        session_info = crud.get_session(db, ids[0])
+        filename_base = Path(session_info.filename).stem if session_info else "bank_statement"
+    else:
+        filename_base = "bank_statement"
 
     output = io.BytesIO()
 

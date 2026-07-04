@@ -43,6 +43,9 @@ class TransactionCreate(TransactionBase):
 class TransactionUpdate(BaseModel):
     category: Optional[str] = None
     status: Optional[str] = None
+    withdrawal: Optional[float] = None
+    deposit: Optional[float] = None
+    balance: Optional[float] = None
 
 
 class TransactionOut(TransactionBase):

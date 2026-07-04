@@ -13,9 +13,59 @@ import StatementGrid from './components/StatementGrid'
 import SessionList from './components/SessionList'
 import CategoryRemapPage from './components/CategoryRemapPage'
 
+const BANKS = [
+  { value: 'ktb', label: 'KTB ธนาคารกรุงไทย',     icon: '🏦', desc: 'ใบแจ้งรายการบัญชีเงินฝากสะสมทรัพย์' },
+  { value: 'ttb', label: 'TTB ทีทีบี (TMB+Thanachart)', icon: '🏦', desc: 'Statement แบบ NT/TR/CA' },
+]
+
+function BankSelectModal({ filename, onConfirm, onCancel }) {
+  const [bank, setBank] = useState('ktb')
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden animate-in fade-in zoom-in duration-200">
+        <div className="bg-gray-900 px-6 py-4">
+          <h2 className="text-white font-bold text-base">📄 เลือกรูปแบบธนาคาร</h2>
+          <p className="text-gray-400 text-xs mt-0.5 truncate">{filename}</p>
+        </div>
+        <div className="p-5 space-y-3">
+          {BANKS.map(b => (
+            <label key={b.value}
+              className={`flex items-start gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${bank === b.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}>
+              <input type="radio" name="bank" value={b.value} checked={bank === b.value}
+                onChange={() => setBank(b.value)} className="mt-0.5 accent-blue-500"/>
+              <div>
+                <p className={`text-sm font-semibold ${bank === b.value ? 'text-blue-700' : 'text-gray-800'}`}>
+                  {b.icon} {b.label}
+                </p>
+                <p className="text-xs text-gray-400 mt-0.5">{b.desc}</p>
+              </div>
+            </label>
+          ))}
+        </div>
+        <div className="flex gap-2 px-5 pb-5">
+          <button onClick={onCancel}
+            className="flex-1 py-2 text-sm rounded-xl border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors">
+            ยกเลิก
+          </button>
+          <button onClick={() => onConfirm(bank)}
+            className="flex-1 py-2 text-sm rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold transition-colors">
+            📤 อัพโหลด
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
+  const [checkedSessionIds, setCheckedSessionIds] = useState(() => {
+    try {
+      const saved = localStorage.getItem('checkedSessionIds')
+      return saved ? new Set(JSON.parse(saved)) : new Set()
+    } catch { return new Set() }
+  })
   const [transactions, setTransactions] = useState([])
   const [categories, setCategories] = useState([])
   const [loading, setLoading] = useState(false)
@@ -23,40 +73,35 @@ export default function App() {
   const [exporting, setExporting] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(null)
   const [showRemap, setShowRemap] = useState(false)
+  const [selectedBank, setSelectedBank] = useState('ktb')
+  const [pendingFile, setPendingFile] = useState(null)
   const fileInputRef = useRef(null)
 
-  // ─── Load sessions list ───────────────────────────────────────────────────
+  // บันทึก checkedSessionIds ลง localStorage
+  useEffect(() => {
+    localStorage.setItem('checkedSessionIds', JSON.stringify([...checkedSessionIds]))
+  }, [checkedSessionIds])
+
   const loadSessions = useCallback(async () => {
     try {
       const res = await getSessions()
       setSessions(res.data)
-      // Auto-select the most recent session if none active
       if (res.data.length > 0 && !activeSessionId) {
         setActiveSessionId(res.data[0].id)
       }
-    } catch {
-      // Backend not ready yet — silent fail
-    }
+    } catch {}
   }, [activeSessionId])
 
-  // ─── Load transactions for active session ────────────────────────────────
-  const loadTransactions = useCallback(async (sessionId) => {
-    if (!sessionId) {
-      setTransactions([])
-      return
-    }
+  const loadTransactions = useCallback(async (sessionIds) => {
+    if (!sessionIds || sessionIds.length === 0) { setTransactions([]); return }
     setLoading(true)
     try {
-      const res = await getTransactions(sessionId)
+      const res = await getTransactions(null, sessionIds)
       setTransactions(res.data)
-    } catch {
-      toast.error('โหลดข้อมูลไม่สำเร็จ')
-    } finally {
-      setLoading(false)
-    }
+    } catch { toast.error('โหลดข้อมูลไม่สำเร็จ') }
+    finally { setLoading(false) }
   }, [])
 
-  // ─── Initial load ─────────────────────────────────────────────────────────
   useEffect(() => {
     const init = async () => {
       setLoading(true)
@@ -68,7 +113,13 @@ export default function App() {
         if (sessionList.length > 0) {
           const firstId = sessionList[0].id
           setActiveSessionId(firstId)
-          const txRes = await getTransactions(firstId)
+          // ใช้ค่าจาก localStorage ถ้ามี และ filter เฉพาะ session ที่ยังมีอยู่จริง
+          const validIds = new Set(sessionList.map(s => s.id))
+          const saved = checkedSessionIds.size > 0
+            ? new Set([...checkedSessionIds].filter(id => validIds.has(id)))
+            : new Set(sessionList.map(s => s.id))
+          setCheckedSessionIds(saved)
+          const txRes = await getTransactions(null, [...saved])
           setTransactions(txRes.data)
         }
       } catch {
@@ -80,44 +131,74 @@ export default function App() {
     init()
   }, [])
 
-  // ─── Switch session ───────────────────────────────────────────────────────
   const handleSelectSession = useCallback(async (sessionId) => {
     setActiveSessionId(sessionId)
-    await loadTransactions(sessionId)
-  }, [loadTransactions])
+  }, [])
 
-  // ─── Upload ──────────────────────────────────────────────────────────────
+  const handleToggleCheck = useCallback(async (sessionId) => {
+    setCheckedSessionIds(prev => {
+      const next = new Set(prev)
+      next.has(sessionId) ? next.delete(sessionId) : next.add(sessionId)
+      return next
+    })
+  }, [])
+
+  const handleToggleAll = useCallback((ids) => {
+    setCheckedSessionIds(new Set(ids))
+  }, [])
+
+  // โหลด transactions ใหม่เมื่อ checkedSessionIds เปลี่ยน
+  useEffect(() => {
+    if (checkedSessionIds.size > 0) {
+      loadTransactions([...checkedSessionIds])
+    } else {
+      setTransactions([])
+    }
+  }, [checkedSessionIds, loadTransactions])
+
   const handleFileChange = async (e) => {
     const file = e.target.files?.[0]
     if (!file) return
+    e.target.value = ''
 
     const isPdf = file.name.toLowerCase().endsWith('.pdf')
-    setUploading(true)
-    setUploadProgress(isPdf ? 'กำลังอ่าน PDF และแยกข้อมูลรายการ...' : `กำลังอัพโหลด ${file.name}...`)
+    if (isPdf) {
+      setPendingFile(file)
+      return
+    }
+    await doUpload(file, 'ktb')
+  }
 
+  const doUpload = async (file, bank) => {
+    const isPdf = file.name.toLowerCase().endsWith('.pdf')
+    const isJson = file.name.toLowerCase().endsWith('.json')
+    setUploading(true)
+    setUploadProgress(
+      isPdf ? 'กำลังอ่าน PDF และแยกข้อมูลรายการ...' :
+      isJson ? `กำลังประมวลผล JSON: ${file.name}...` :
+      `กำลังอัพโหลด ${file.name}...`
+    )
     const tid = toast.loading(
-      isPdf ? `📄 กำลังอ่าน PDF: ${file.name}` : `📊 กำลังอัพโหลด: ${file.name}`,
+      isPdf  ? `📄 กำลังอ่าน PDF: ${file.name}` :
+      isJson ? `📋 กำลังอ่าน JSON: ${file.name}` :
+               `📊 กำลังอัพโหลด: ${file.name}`,
       { duration: Infinity }
     )
-
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const res = await uploadFile(formData)
+      const res = await uploadFile(formData, bank)
       const data = res.data
-
       if (data.is_duplicate) {
-        toast.success(`ไฟล์นี้เคยนำเข้าแล้ว — โหลด session เดิม`, { id: tid })
+        toast.success('ไฟล์นี้เคยนำเข้าแล้ว — โหลด session เดิม', { id: tid })
       } else {
         toast.success(data.message, { id: tid })
       }
-
-      // Refresh sessions and switch to new one
       const sessRes = await getSessions()
       setSessions(sessRes.data)
       if (data.session_id) {
         setActiveSessionId(data.session_id)
-        await loadTransactions(data.session_id)
+        setCheckedSessionIds(prev => new Set([...prev, data.session_id]))
       }
     } catch (err) {
       const msg = err.response?.data?.detail || 'นำเข้าไม่สำเร็จ'
@@ -125,35 +206,29 @@ export default function App() {
     } finally {
       setUploading(false)
       setUploadProgress(null)
-      e.target.value = ''
     }
   }
 
-  // ─── Export ──────────────────────────────────────────────────────────────
   const handleExport = async () => {
+    const ids = [...checkedSessionIds]
+    if (ids.length === 0) { toast.error('เลือกไฟล์ก่อน Export'); return }
     setExporting(true)
-    const tid = toast.loading('กำลัง Export Excel...')
+    const tid = toast.loading(`กำลัง Export Excel (${ids.length} ไฟล์)...`)
     try {
-      const res = await exportExcel(activeSessionId)
+      const res = await exportExcel(null, ids)
       const url = URL.createObjectURL(res.data)
-      const activeSession = sessions.find(s => s.id === activeSessionId)
-      const baseName = activeSession
-        ? activeSession.filename.replace(/\.[^.]+$/, '')
-        : 'bank_statement'
+      const baseName = ids.length === 1
+        ? (sessions.find(s => s.id === ids[0])?.filename.replace(/\.[^.]+$/,'') || 'bank_statement')
+        : `combined_${ids.length}_files`
       const a = document.createElement('a')
-      a.href = url
-      a.download = `${baseName}_categorized.xlsx`
-      a.click()
+      a.href = url; a.download = `${baseName}_categorized.xlsx`; a.click()
       URL.revokeObjectURL(url)
       toast.success('Export สำเร็จ!', { id: tid })
     } catch {
       toast.error('Export ไม่สำเร็จ', { id: tid })
-    } finally {
-      setExporting(false)
-    }
+    } finally { setExporting(false) }
   }
 
-  // ─── Delete session ───────────────────────────────────────────────────────
   const handleDeleteSession = async (sessionId) => {
     const session = sessions.find(s => s.id === sessionId)
     if (!window.confirm(`ลบ "${session?.filename}" และข้อมูลทั้งหมด?\nไม่สามารถยกเลิกได้`)) return
@@ -161,28 +236,33 @@ export default function App() {
       await deleteSession(sessionId)
       const remaining = sessions.filter(s => s.id !== sessionId)
       setSessions(remaining)
-      if (activeSessionId === sessionId) {
-        const nextId = remaining[0]?.id || null
-        setActiveSessionId(nextId)
-        await loadTransactions(nextId)
-      }
+      setCheckedSessionIds(prev => { const n = new Set(prev); n.delete(sessionId); return n })
+      if (activeSessionId === sessionId) setActiveSessionId(remaining[0]?.id || null)
       toast.success('ลบ session แล้ว')
-    } catch {
-      toast.error('ลบไม่สำเร็จ')
-    }
+    } catch { toast.error('ลบไม่สำเร็จ') }
   }
 
-  // ─── Transactions updated (from grid) ────────────────────────────────────
   const handleTransactionsUpdate = useCallback((updater) => {
     setTransactions(updater)
-    // Refresh session list counts in background
     getSessions().then(r => setSessions(r.data)).catch(() => {})
   }, [])
 
   const activeSession = sessions.find(s => s.id === activeSessionId)
+  const checkedCount = checkedSessionIds.size
 
   return (
     <div className="min-h-screen bg-gray-50">
+      {pendingFile && (
+        <BankSelectModal
+          filename={pendingFile.name}
+          onConfirm={async (bank) => {
+            const file = pendingFile
+            setPendingFile(null)
+            await doUpload(file, bank)
+          }}
+          onCancel={() => setPendingFile(null)}
+        />
+      )}
       {showRemap && (
         <CategoryRemapPage
           onClose={() => setShowRemap(false)}
@@ -217,7 +297,7 @@ export default function App() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.xlsx,.xls,.csv"
+              accept=".pdf,.xlsx,.xls,.csv,.json"
               onChange={handleFileChange}
               className="hidden"
             />
@@ -228,17 +308,17 @@ export default function App() {
             >
               {uploading
                 ? <><span className="animate-spin inline-block">⟳</span> กำลังประมวลผล...</>
-                : <><span>📤</span> อัพโหลด PDF / Excel</>
+                : <><span>📤</span> อัพโหลด PDF / Excel / JSON</>
               }
             </button>
 
-            {activeSessionId && (
+            {checkedCount > 0 && (
               <button
                 onClick={handleExport}
                 disabled={exporting || transactions.length === 0}
                 className="btn-success flex items-center gap-2 text-sm"
               >
-                {exporting ? <><span className="animate-spin">⟳</span> Export...</> : <><span>📥</span> Export Excel</>}
+                {exporting ? <><span className="animate-spin">⟳</span> Export...</> : <><span>📥</span> Export Excel {checkedCount > 1 ? `(${checkedCount} ไฟล์)` : ''}</>}
               </button>
             )}
 
@@ -267,10 +347,12 @@ export default function App() {
 
       {/* Main */}
       <main className="max-w-screen-xl mx-auto px-6 py-6 space-y-5">
-        {/* Session list (resume work) */}
         <SessionList
           sessions={sessions}
           activeSessionId={activeSessionId}
+          checkedIds={checkedSessionIds}
+          onToggleCheck={handleToggleCheck}
+          onToggleAll={handleToggleAll}
           onSelect={handleSelectSession}
           onDelete={handleDeleteSession}
         />
@@ -282,22 +364,14 @@ export default function App() {
               <p className="text-gray-500 font-medium">กำลังโหลดข้อมูล...</p>
             </div>
           </div>
-        ) : !activeSessionId ? (
-          /* Empty state */
+        ) : checkedCount === 0 ? (
           <div className="flex flex-col items-center justify-center py-32 space-y-6">
             <div className="text-7xl">📄</div>
             <div className="text-center space-y-2">
-              <h2 className="text-xl font-bold text-gray-700">เริ่มต้นด้วยการอัพโหลด PDF</h2>
-              <p className="text-gray-400 text-sm max-w-md">
-                รองรับ PDF Bank Statement จากธนาคารกรุงไทย (KTB) และ Excel/CSV
-              </p>
+              <h2 className="text-xl font-bold text-gray-700">ยังไม่ได้เลือกไฟล์</h2>
+              <p className="text-gray-400 text-sm max-w-md">ติ๊กเลือกไฟล์ที่ต้องการจากรายการด้านบน หรืออัพโหลดไฟล์ใหม่</p>
             </div>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="btn-primary text-base px-8 py-3"
-            >
-              📤 อัพโหลดไฟล์
-            </button>
+            <button onClick={() => fileInputRef.current?.click()} className="btn-primary text-base px-8 py-3">📤 อัพโหลดไฟล์</button>
           </div>
         ) : (
           <>
