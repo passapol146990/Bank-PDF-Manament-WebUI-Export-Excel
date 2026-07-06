@@ -110,7 +110,12 @@ def get_category_summary(session_id: Optional[int] = Query(None), db: Session = 
 @app.put("/api/transactions/bulk", tags=["Transactions"])
 def bulk_update(request: schemas.BulkUpdateRequest, db: Session = Depends(get_db)):
     updated = crud.bulk_update_transactions(
-        db, ids=request.ids, category=request.category, status=request.status
+        db,
+        ids=request.ids,
+        category=request.category,
+        status=request.status,
+        withdrawal=request.withdrawal,
+        deposit=request.deposit,
     )
     session_ids = set(
         tx.session_id for tx in
@@ -120,6 +125,215 @@ def bulk_update(request: schemas.BulkUpdateRequest, db: Session = Depends(get_db
     for sid in session_ids:
         crud.update_session_counts(db, sid)
     return {"updated_count": len(updated), "message": f"Updated {len(updated)} transactions"}
+
+
+@app.put("/api/transactions/bulk-flow", tags=["Transactions"])
+def bulk_update_flow(request: schemas.BulkFlowUpdateRequest, db: Session = Depends(get_db)):
+    if request.flow not in ("in", "out"):
+        raise HTTPException(400, "flow ต้องเป็น 'in' หรือ 'out'")
+    updated = crud.bulk_update_flow(db, ids=request.ids, flow=request.flow)
+    return {"updated_count": len(updated), "message": f"Updated flow {len(updated)} transactions"}
+
+
+@app.post("/api/transactions/bulk-assign", tags=["Transactions"])
+def bulk_assign(request: schemas.BulkAssignRequest, db: Session = Depends(get_db)):
+    if not request.category and not request.flow:
+        raise HTTPException(400, "ต้องระบุ category หรือ flow อย่างน้อยหนึ่งอย่าง")
+
+    def parse_date_key(s: str, default_year: str = "2024") -> str:
+        """แปลง DD/MM/YY, DD/MM/YYYY หรือ DD/MM → YYYY-MM-DD
+        DD/MM ที่ไม่มีปี จะใช้ default_year"""
+        if not s:
+            return ""
+        p = s.strip().split("/")
+        if len(p) == 3:
+            d, m, y = p
+            if len(y) == 2:
+                y = "20" + y
+            return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+        elif len(p) == 2:
+            d, m = p
+            return f"{default_year}-{m.zfill(2)}-{d.zfill(2)}"
+        return s
+
+    q = db.query(models.Transaction)
+    if request.session_ids:
+        q = q.filter(models.Transaction.session_id.in_(request.session_ids))
+    all_txs = q.order_by(models.Transaction.id).all()
+
+    # ตรวจหาปีจาก transactions จริงเพื่อใช้เป็น default_year สำหรับ DD/MM
+    years = set()
+    for t in all_txs:
+        if t.date:
+            p = t.date.strip().split("/")
+            if len(p) == 3 and len(p[2]) >= 2:
+                years.add("20" + p[2] if len(p[2]) == 2 else p[2])
+    default_year = sorted(years)[0] if years else "2024"
+
+    all_txs.sort(key=lambda t: (parse_date_key(t.date or "", default_year), t.id))
+
+    # กรองตาม date range
+    if request.date_from or request.date_to:
+        d_from = parse_date_key(request.date_from or "", default_year)
+        d_to   = parse_date_key(request.date_to   or "", default_year) or "9999-12-31"
+        all_txs = [
+            t for t in all_txs
+            if t.date and d_from <= parse_date_key(t.date, default_year) <= d_to
+        ]
+
+    # กรองตาม row range (1-based)
+    if request.row_from is not None or request.row_to is not None:
+        r_from = (request.row_from or 1) - 1
+        r_to   = (request.row_to or len(all_txs))
+        all_txs = all_txs[r_from:r_to]
+
+    # กรองตาม flow_filter
+    if request.flow_filter == "in":
+        all_txs = [t for t in all_txs if t.deposit is not None]
+    elif request.flow_filter == "out":
+        all_txs = [t for t in all_txs if t.withdrawal is not None]
+
+    if not all_txs:
+        return {"updated_count": 0, "ids": [], "message": "ไม่พบรายการในช่วงที่ระบุ"}
+
+    ids = [t.id for t in all_txs]
+
+    update_vals = {}
+    if request.category:
+        update_vals["category"] = request.category
+        update_vals["status"]   = "categorized"
+    if request.flow:
+        for tx in all_txs:
+            amount = tx.withdrawal if tx.withdrawal is not None else tx.deposit
+            if amount is None:
+                continue
+            tx.withdrawal = amount if request.flow == "out" else None
+            tx.deposit    = amount if request.flow == "in"  else None
+        db.commit()
+
+    if update_vals:
+        db.query(models.Transaction).filter(
+            models.Transaction.id.in_(ids)
+        ).update(update_vals, synchronize_session=False)
+        db.commit()
+
+    affected = set(t.session_id for t in all_txs if t.session_id)
+    for sid in affected:
+        crud.update_session_counts(db, sid)
+
+    return {"updated_count": len(ids), "ids": ids, "message": f"อัพเดต {len(ids)} รายการสำเร็จ"}
+
+
+@app.post("/api/upload/reimport", tags=["Upload"])
+async def reimport_file(
+    file: UploadFile = File(...),
+    bank: str = Query("ktb"),
+    db: Session = Depends(get_db)
+):
+    """Re-import ไฟล์เดิม — ลบรายการเก่า import ใหม่ แต่คง category ที่จัดไว้แล้ว
+    Match รายการด้วย (date, balance, via) → restore category เดิม
+    """
+    import hashlib
+
+    filename = file.filename or ""
+    ext = Path(filename).suffix.lower()
+    contents = await file.read()
+    file_hash = hashlib.md5(contents).hexdigest()
+
+    existing = crud.get_session_by_hash(db, file_hash)
+
+    # Parse ไฟล์ใหม่
+    if ext == ".pdf":
+        try:
+            statement = parse_ttb_pdf(contents, filename) if bank == "ttb" else parse_ktb_pdf(contents, filename)
+        except Exception as e:
+            raise HTTPException(400, f"ไม่สามารถอ่าน PDF ได้: {str(e)}")
+        new_txs = statement.transactions
+    elif ext == ".json":
+        import json
+        try:
+            data = json.loads(contents.decode("utf-8-sig"))
+        except Exception as e:
+            raise HTTPException(400, f"อ่าน JSON ไม่ได้: {str(e)}")
+        new_txs = None  # JSON จะ handle แยก
+    else:
+        raise HTTPException(400, "Reimport รองรับเฉพาะ PDF และ JSON")
+
+    if not new_txs:
+        raise HTTPException(400, "ไม่พบข้อมูลรายการในไฟล์")
+
+    # หา session ที่ตรงกัน (hash เดิม หรือ filename เดิม)
+    target_session = existing or crud.get_session_by_filename(db, filename)
+    if not target_session:
+        raise HTTPException(404, "ไม่พบ session เดิม — ใช้ upload ปกติแทน")
+
+    session_id = target_session.id
+
+    # สร้าง category map จากรายการเดิม: key = (date, round(balance,2), via) → category
+    old_txs = crud.get_transactions(db, session_id=session_id)
+    category_map = {}
+    for t in old_txs:
+        if t.category and t.category != "Uncategorized":
+            key = (t.date or "", round(t.balance or 0, 2), t.via or "")
+            category_map[key] = (t.category, t.status)
+
+    # ลบรายการเดิมทั้งหมด
+    db.query(models.Transaction).filter(
+        models.Transaction.session_id == session_id
+    ).delete()
+    db.commit()
+
+    # อัพเดต session metadata + hash ใหม่
+    db.query(models.UploadSession).filter(
+        models.UploadSession.id == session_id
+    ).update({
+        "file_hash": file_hash,
+        "filename": filename,
+    })
+    if ext == ".pdf":
+        db.query(models.UploadSession).filter(
+            models.UploadSession.id == session_id
+        ).update({
+            "account_number": statement.account_number,
+            "account_name": statement.account_name,
+            "bank_name": statement.bank_name,
+            "period_start": statement.period_start,
+            "period_end": statement.period_end,
+        })
+    db.commit()
+
+    # Insert รายการใหม่ พร้อม restore category
+    matched = 0
+    tx_creates = []
+    for tx in new_txs:
+        key = (tx.date or "", round(tx.balance or 0, 2), tx.via or "")
+        cat, stat = category_map.get(key, ("Uncategorized", "pending"))
+        if cat != "Uncategorized":
+            matched += 1
+        tx_creates.append(schemas.TransactionCreate(
+            session_id=session_id,
+            date=tx.date,
+            particulars=tx.particulars,
+            chq_no=getattr(tx, 'chq_no', None),
+            withdrawal=tx.withdrawal,
+            deposit=tx.deposit,
+            balance=tx.balance,
+            via=tx.via,
+            category=cat,
+            status=stat,
+        ))
+
+    crud.bulk_create_transactions(db, tx_creates)
+    crud.update_session_counts(db, session_id)
+
+    return {
+        "message": f"Re-import สำเร็จ {len(tx_creates)} รายการ (คง category เดิม {matched} รายการ)",
+        "session_id": session_id,
+        "count": len(tx_creates),
+        "matched_categories": matched,
+        "is_duplicate": False,
+        "can_reimport": False,
+    }
 
 
 @app.get("/api/transactions/distinct-categories", tags=["Transactions"])
@@ -212,10 +426,13 @@ async def _handle_pdf_upload(contents: bytes, filename: str, db: Session, bank: 
     existing = crud.get_session_by_hash(db, file_hash)
     if existing:
         return {
-            "message": f"ไฟล์นี้เคยนำเข้าแล้ว (session #{existing.id}) — กำลังโหลดข้อมูลเดิม",
+            "message": f"ไฟล์นี้เคยนำเข้าแล้ว (session #{existing.id})",
             "session_id": existing.id,
             "count": existing.total_rows,
             "is_duplicate": True,
+            "can_reimport": True,
+            "filename": filename,
+            "bank": bank,
         }
 
     try:
@@ -229,7 +446,9 @@ async def _handle_pdf_upload(contents: bytes, filename: str, db: Session, bank: 
     if not statement.transactions:
         raise HTTPException(400, "ไม่พบข้อมูลรายการในไฟล์ PDF — กรุณาตรวจสอบรูปแบบไฟล์")
 
-    # Create session
+    # หา session ที่ชื่อไฟล์เดียวกัน (อาจเป็นไฟล์อัปเดตที่ hash ต่างกัน)
+    same_name_session = crud.get_session_by_filename(db, filename)
+
     session = crud.create_session(
         db,
         filename=filename,
@@ -241,7 +460,6 @@ async def _handle_pdf_upload(contents: bytes, filename: str, db: Session, bank: 
         period_end=statement.period_end,
     )
 
-    # Import transactions
     tx_creates = [
         schemas.TransactionCreate(
             session_id=session.id,
@@ -267,6 +485,8 @@ async def _handle_pdf_upload(contents: bytes, filename: str, db: Session, bank: 
         "period_start": statement.period_start,
         "period_end": statement.period_end,
         "is_duplicate": False,
+        "can_reimport": False,
+        "prev_session_id": same_name_session.id if same_name_session else None,
     }
 
 
@@ -569,6 +789,7 @@ def export_excel(
     db_cat_color = {c.name: c.color.lstrip("#") for c in db_cats}
 
     # ถ้าเลือกหลาย session ให้ชื่อไฟล์เป็น combined
+    session_info = None
     if ids and len(ids) > 1:
         filename_base = f"combined_{len(ids)}_files"
     elif session_id:
@@ -835,11 +1056,15 @@ def export_excel(
         wb.move_sheet("สรุปยอดรวม", offset=-len(wb.sheetnames) + 1)
 
     output.seek(0)
+    from urllib.parse import quote
     safe_name = f"{filename_base}_categorized.xlsx"
+    ascii_name = safe_name.encode('ascii', 'ignore').decode('ascii') or "export.xlsx"
+    encoded_name = quote(safe_name, safe='')
+    disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        headers={"Content-Disposition": disposition},
     )
 
 

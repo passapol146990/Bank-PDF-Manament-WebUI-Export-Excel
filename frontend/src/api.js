@@ -24,6 +24,12 @@ export const updateTransaction = (id, data) => api.put(`/transactions/${id}`, da
 export const bulkUpdateTransactions = (ids, category) =>
   api.put('/transactions/bulk', { ids, category, status: 'categorized' })
 
+export const bulkUpdateFlow = (ids, flow) =>
+  api.put('/transactions/bulk-flow', { ids, flow })
+
+export const bulkAssign = (params) =>
+  api.post('/transactions/bulk-assign', params)
+
 export const deleteAllTransactions = () => api.delete('/transactions')
 
 export const getStats = (sessionId = null, sessionIds = null) => {
@@ -43,6 +49,11 @@ export const getCategorySummary = (sessionId = null, sessionIds = null) => {
 // ─── Upload ───────────────────────────────────────────────────────────────────
 export const uploadFile = (formData, bank = 'ktb') =>
   api.post(`/upload?bank=${bank}`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+
+export const reimportFile = (formData, bank = 'ktb') =>
+  api.post(`/upload/reimport?bank=${bank}`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   })
 

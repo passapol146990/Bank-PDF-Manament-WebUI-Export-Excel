@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import toast from 'react-hot-toast'
-import { updateTransaction, bulkUpdateTransactions } from '../api'
+import { updateTransaction, bulkUpdateTransactions, bulkUpdateFlow, bulkAssign } from '../api'
 import CategoryManager from './CategoryManager'
 
 function hexToRgb(hex) {
@@ -86,6 +86,182 @@ function FlowEditCell({ tx, onSave }) {
   )
 }
 
+function BulkAssignModal({ categoryOptions, totalRows, onApply, onClose }) {
+  const [step, setStep] = useState(1)
+  const [mode, setMode]       = useState('date')
+  const [rowFrom, setRowFrom] = useState('')
+  const [rowTo, setRowTo]     = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
+  const [flowFilter, setFlowFilter] = useState('')  // '' | 'in' | 'out'
+  const [category, setCategory]     = useState('')
+
+  const rangeValid = mode === 'date' ? (dateFrom || dateTo) : (rowFrom || rowTo)
+  const canNext1 = !!rangeValid
+  const canNext2 = true  // flow เป็น optional
+  const canApply = !!category
+
+  const STEPS = ['1 กำหนดช่วง', '2 ประเภทเงิน', '3 หมวดหมู่']
+
+  const summary = () => {
+    const range = mode === 'date'
+      ? `${dateFrom||'...'} — ${dateTo||'...'}`
+      : `ลำดับ ${rowFrom||'1'} — ${rowTo||totalRows}`
+    const fl = flowFilter === 'in' ? ' · เงินเข้า' : flowFilter === 'out' ? ' · เงินออก' : ' · ทุกรายการ'
+    return range + fl
+  }
+
+  const handleApply = () => {
+    if (!canApply) return
+    const params = { category, flow_filter: flowFilter || undefined }
+    if (mode === 'date') {
+      if (dateFrom) params.date_from = dateFrom
+      if (dateTo)   params.date_to   = dateTo
+    } else {
+      if (rowFrom) params.row_from = parseInt(rowFrom)
+      if (rowTo)   params.row_to   = parseInt(rowTo)
+    }
+    onApply(params)
+  }
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden" onClick={e=>e.stopPropagation()}>
+
+        {/* Header */}
+        <div className="bg-gray-900 px-5 py-4 flex items-center justify-between">
+          <div>
+            <h2 className="text-white font-bold text-sm">⚡ กำหนด Bulk ช่วงข้อมูล</h2>
+            <p className="text-gray-400 text-xs mt-0.5">รวม {totalRows} รายการ</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+        </div>
+
+        {/* Step indicator */}
+        <div className="flex border-b border-gray-100">
+          {STEPS.map((label, i) => {
+            const s = i + 1
+            const active = step === s
+            const done   = step > s
+            return (
+              <button key={s} onClick={() => done && setStep(s)}
+                className={`flex-1 py-2.5 text-xs font-semibold transition-colors border-b-2 ${active ? 'border-blue-500 text-blue-600' : done ? 'border-transparent text-gray-500 hover:text-gray-700 cursor-pointer' : 'border-transparent text-gray-300 cursor-default'}`}>
+                {done ? '✓ ' : ''}{label}
+              </button>
+            )
+          })}
+        </div>
+
+        <div className="p-5">
+          {/* ── STEP 1: ช่วงข้อมูล ── */}
+          {step === 1 && (
+            <div className="space-y-4">
+              <div className="flex rounded-xl overflow-hidden border border-gray-200 text-sm font-medium">
+                <button onClick={()=>setMode('date')} className={`flex-1 py-2 transition-colors ${mode==='date'?'bg-blue-600 text-white':'bg-white text-gray-600 hover:bg-gray-50'}`}>📅 ช่วงวันที่</button>
+                <button onClick={()=>setMode('row')}  className={`flex-1 py-2 transition-colors border-l border-gray-200 ${mode==='row'?'bg-blue-600 text-white':'bg-white text-gray-600 hover:bg-gray-50'}`}>🔢 ช่วงลำดับที่</button>
+              </div>
+
+              {mode === 'date' && (
+                <div className="flex items-end gap-3">
+                  <div className="flex-1">
+                    <label className="text-xs text-gray-500 mb-1 block">วันที่เริ่มต้น</label>
+                    <input value={dateFrom} onChange={e=>setDateFrom(e.target.value)} placeholder="เช่น 06/03/24"
+                      className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-300"/>
+                  </div>
+                  <span className="text-gray-400 pb-2">—</span>
+                  <div className="flex-1">
+                    <label className="text-xs text-gray-500 mb-1 block">วันที่สิ้นสุด</label>
+                    <input value={dateTo} onChange={e=>setDateTo(e.target.value)} placeholder="เช่น 18/03/24"
+                      className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-300"/>
+                  </div>
+                </div>
+              )}
+
+              {mode === 'row' && (
+                <div className="flex items-end gap-3">
+                  <div className="flex-1">
+                    <label className="text-xs text-gray-500 mb-1 block">ลำดับเริ่มต้น</label>
+                    <input type="number" min={1} value={rowFrom} onChange={e=>setRowFrom(e.target.value)} placeholder="1"
+                      className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-300"/>
+                  </div>
+                  <span className="text-gray-400 pb-2">—</span>
+                  <div className="flex-1">
+                    <label className="text-xs text-gray-500 mb-1 block">ลำดับสิ้นสุด</label>
+                    <input type="number" min={1} value={rowTo} onChange={e=>setRowTo(e.target.value)} placeholder={String(totalRows)}
+                      className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-300"/>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── STEP 2: ประเภทเงิน ── */}
+          {step === 2 && (
+            <div className="space-y-3">
+              <p className="text-xs text-gray-500">ช่วงที่เลือก: <span className="font-medium text-gray-700">{mode==='date'?`${dateFrom||'...'} — ${dateTo||'...'}`:`ลำดับ ${rowFrom||'1'} — ${rowTo||totalRows}`}</span></p>
+              <p className="text-sm text-gray-600">กรองเฉพาะประเภทเงินใด? <span className="text-gray-400 text-xs">(ไม่เลือก = ทุกรายการ)</span></p>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { val: '',    label: 'ทุกรายการ', cls: 'border-gray-300 text-gray-700', active: 'bg-gray-800 text-white border-gray-800' },
+                  { val: 'in',  label: '↓ เงินเข้า', cls: 'border-green-300 text-green-700', active: 'bg-green-500 text-white border-green-500' },
+                  { val: 'out', label: '↑ เงินออก',  cls: 'border-red-300 text-red-700',   active: 'bg-red-500 text-white border-red-500' },
+                ].map(o => (
+                  <button key={o.val} onClick={()=>setFlowFilter(o.val)}
+                    className={`py-3 rounded-xl border-2 text-sm font-semibold transition-all ${flowFilter===o.val ? o.active : 'bg-white ' + o.cls + ' hover:opacity-80'}`}>
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── STEP 3: หมวดหมู่ ── */}
+          {step === 3 && (
+            <div className="space-y-3">
+              <div className="bg-gray-50 rounded-xl px-4 py-3 text-xs text-gray-600 space-y-1">
+                <p>📌 ช่วง: <span className="font-medium text-gray-800">{mode==='date'?`${dateFrom||'...'} — ${dateTo||'...'}`:`ลำดับ ${rowFrom||'1'} — ${rowTo||totalRows}`}</span></p>
+                <p>💰 ประเภท: <span className="font-medium text-gray-800">{flowFilter==='in'?'เงินเข้าเท่านั้น':flowFilter==='out'?'เงินออกเท่านั้น':'ทุกรายการ'}</span></p>
+              </div>
+              <div>
+                <label className="text-sm font-medium text-gray-700 mb-2 block">เลือกหมวดหมู่ที่ต้องการกำหนด</label>
+                <div className="grid grid-cols-2 gap-2 max-h-52 overflow-y-auto pr-1">
+                  {categoryOptions.filter(c=>c!=='Uncategorized').map(c => (
+                    <button key={c} onClick={()=>setCategory(c)}
+                      className={`py-2.5 px-3 rounded-xl border-2 text-sm font-medium text-left transition-all truncate ${category===c?'border-blue-500 bg-blue-50 text-blue-700':'border-gray-200 hover:border-gray-300 text-gray-700'}`}>
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer buttons */}
+        <div className="flex gap-2 px-5 pb-5">
+          <button onClick={onClose} className="px-4 py-2 text-sm rounded-xl border border-gray-200 text-gray-600 hover:bg-gray-50">ยกเลิก</button>
+          {step > 1 && (
+            <button onClick={()=>setStep(s=>s-1)} className="px-4 py-2 text-sm rounded-xl border border-gray-200 text-gray-600 hover:bg-gray-50">← ย้อนกลับ</button>
+          )}
+          <div className="flex-1"/>
+          {step < 3 && (
+            <button onClick={()=>setStep(s=>s+1)} disabled={step===1&&!canNext1}
+              className="px-5 py-2 text-sm rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold">
+              ถัดไป →
+            </button>
+          )}
+          {step === 3 && (
+            <button onClick={handleApply} disabled={!canApply}
+              className="px-5 py-2 text-sm rounded-xl bg-green-600 hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold">
+              ✅ ยืนยัน
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PaginationBar({ page, totalPages, pageSize, totalItems, onPage, onPageSize, onJumpUncategorized }) {
   const [jumpVal, setJumpVal] = useState('')
   const handleJump = e => { e.preventDefault(); const n=parseInt(jumpVal,10); if(n>=1&&n<=totalPages){onPage(n);setJumpVal('')} }
@@ -159,6 +335,7 @@ export default function StatementGrid({ transactions, categories, onTransactions
   const [filterCategory, setFilterCategory] = useState('all')
   const [search, setSearch]             = useState('')
   const [showCategoryManager, setShowCategoryManager] = useState(false)
+  const [showBulkAssign, setShowBulkAssign] = useState(false)
   const [page, setPage]                 = useState(1)
   const [pageSize, setPageSize]         = useState(50)
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -169,7 +346,6 @@ export default function StatementGrid({ transactions, categories, onTransactions
   const syncHistorySize = useCallback(() => setHistorySize({undo:undoStack.current.length,redo:redoStack.current.length}),[])
   const isDragging     = useRef(false)
   const dragSelectMode = useRef(null)
-  const saveTimeouts   = useRef({})
   const selectedIdsRef = useRef(selectedIds)
   const hoveredTxIdRef = useRef(null)
   const tableTopRef    = useRef(null)
@@ -217,15 +393,11 @@ export default function StatementGrid({ transactions, categories, onTransactions
       undoStack.current=[{ids,prevCategories:prevMap,nextCategory:newCat},...undoStack.current].slice(0,UNDO_LIMIT)
       redoStack.current=[]; syncHistorySize()
     }
-    ids.forEach(id=>{
-      if(saveTimeouts.current[id]) clearTimeout(saveTimeouts.current[id])
-      setSavingIds(prev=>new Set([...prev,id]))
-      saveTimeouts.current[id]=setTimeout(async()=>{
-        try { await retryFn(()=>updateTransaction(id,{category:newCat,status:'categorized'})) }
-        catch { toast.error(`บันทึก #${id} ไม่สำเร็จ (ลอง 3 รอบแล้ว)`,{duration:5000}) }
-        setSavingIds(prev=>{ const n=new Set(prev); n.delete(id); return n })
-      },400)
-    })
+    // batch save ทุก id ในครั้งเดียว
+    setSavingIds(prev=>new Set([...prev,...ids]))
+    retryFn(() => bulkUpdateTransactions(ids, newCat))
+      .catch(() => toast.error(`บันทึก ${ids.length} รายการไม่สำเร็จ (ลอง 3 รอบแล้ว)`, {duration:5000}))
+      .finally(() => setSavingIds(prev=>{ const n=new Set(prev); ids.forEach(id=>n.delete(id)); return n }))
   },[transactions,onTransactionsUpdate,syncHistorySize])
 
   const handleUndo = useCallback(()=>{
@@ -266,12 +438,18 @@ export default function StatementGrid({ transactions, categories, onTransactions
     if(ids.length===0) return
     if (bulkFlow) {
       const tid=toast.loading(`กำลังสลับ ${ids.length} รายการ...`)
-      const updates=ids.map(id=>{ const t=transactions.find(x=>x.id===id); const a=t?.withdrawal??t?.deposit??0; return {id,withdrawal:bulkFlow==='out'?a:null,deposit:bulkFlow==='in'?a:null} })
-      onTransactionsUpdate(prev=>prev.map(t=>{ const u=updates.find(x=>x.id===t.id); return u?{...t,...u}:t }))
-      let fail=0
-      await Promise.all(updates.map(async u=>{ try{ await retryFn(()=>updateTransaction(u.id,{withdrawal:u.withdrawal,deposit:u.deposit})) }catch{ fail++ } }))
-      if(fail) toast.error(`${fail} รายการบันทึกไม่สำเร็จ`,{id:tid,duration:5000})
-      else toast.success(`สลับ ${ids.length} รายการ → ${bulkFlow==='out'?'เงินออก':'เงินเข้า'}`,{id:tid,duration:3000})
+      // optimistic update
+      onTransactionsUpdate(prev=>prev.map(t=>{
+        if(!ids.includes(t.id)) return t
+        const amount = t.withdrawal ?? t.deposit ?? 0
+        return {...t, withdrawal: bulkFlow==='out'?amount:null, deposit: bulkFlow==='in'?amount:null}
+      }))
+      try {
+        await retryFn(()=>bulkUpdateFlow(ids, bulkFlow))
+        toast.success(`สลับ ${ids.length} รายการ → ${bulkFlow==='out'?'เงินออก':'เงินเข้า'}`,{id:tid,duration:3000})
+      } catch {
+        toast.error('บันทึกไม่สำเร็จ (ลอง 3 รอบแล้ว)',{id:tid,duration:5000})
+      }
       setBulkFlow(''); setSelectedIds(new Set()); return
     }
     if (!bulkCategory) { toast.error('เลือกหมวดหมู่หรือประเภทเงินก่อน'); return }
@@ -340,12 +518,40 @@ export default function StatementGrid({ transactions, categories, onTransactions
   useEffect(()=>{const stop=()=>{isDragging.current=false};window.addEventListener('mouseup',stop);return()=>window.removeEventListener('mouseup',stop)},[])
   const handleCategoriesUpdate=useCallback(u=>onCategoriesUpdate(u),[onCategoriesUpdate])
 
+  const handleBulkAssign = useCallback(async (params) => {
+    setShowBulkAssign(false)
+    const sessionIds = [...new Set(transactions.map(t=>t.session_id).filter(Boolean))]
+    const payload = { ...params, session_ids: sessionIds.length ? sessionIds : undefined }
+    const tid = toast.loading('กำลังประมวลผล...')
+    try {
+      const res = await retryFn(() => bulkAssign(payload))
+      const { updated_count, ids: updatedIds } = res.data
+      if (updatedIds?.length > 0 && params.category) {
+        onTransactionsUpdate(prev => prev.map(t =>
+          updatedIds.includes(t.id) ? { ...t, category: params.category, status: 'categorized' } : t
+        ))
+      }
+      const flowLabel = params.flow_filter === 'in' ? ' (เงินเข้า)' : params.flow_filter === 'out' ? ' (เงินออก)' : ''
+      toast.success(`อัพเดต ${updated_count} รายการ${flowLabel} → ${params.category}`, { id: tid, duration: 4000 })
+    } catch {
+      toast.error('บันทึกไม่สำเร็จ', { id: tid, duration: 5000 })
+    }
+  }, [transactions, onTransactionsUpdate])
+
   return (
     <>
       {showCategoryManager && (
         <CategoryManager categories={categories} onCategoriesUpdate={handleCategoriesUpdate}
           keyBindings={keyBindings} onKeyBindingsChange={kb=>{setKeyBindings(kb);localStorage.setItem('kb_shortcuts',JSON.stringify(kb))}}
           onClose={()=>setShowCategoryManager(false)}/>
+      )}
+      {showBulkAssign && (
+        <BulkAssignModal
+          categoryOptions={categoryOptions}
+          totalRows={filtered.length}
+          onApply={handleBulkAssign}
+          onClose={()=>setShowBulkAssign(false)}
+        />
       )}
 
       {/* Floating bulk-action bar */}
@@ -399,6 +605,10 @@ export default function StatementGrid({ transactions, categories, onTransactions
             <button onClick={()=>setShowCategoryManager(true)}
               className="flex items-center gap-1.5 px-3 py-2 text-sm bg-gray-100 hover:bg-gray-200 rounded-lg border border-gray-200 text-gray-600 font-medium transition-colors whitespace-nowrap">
               🗂️ จัดการหมวดหมู่
+            </button>
+            <button onClick={()=>setShowBulkAssign(true)}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-200 text-indigo-700 font-medium transition-colors whitespace-nowrap">
+              ⚡ กำหนดช่วง Bulk
             </button>
             <div className="flex items-center gap-1">
               <button onClick={handleUndo} disabled={historySize.undo===0} title={`ย้อน Ctrl+Z (${historySize.undo})`}

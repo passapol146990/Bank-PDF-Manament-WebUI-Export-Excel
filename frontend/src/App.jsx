@@ -6,6 +6,7 @@ import {
   getTransactions,
   getCategories,
   uploadFile,
+  reimportFile,
   exportExcel,
 } from './api'
 import DashboardSummary from './components/DashboardSummary'
@@ -57,6 +58,41 @@ function BankSelectModal({ filename, onConfirm, onCancel }) {
   )
 }
 
+function ReimportModal({ filename, sessionId, count, onReimport, onKeepOld, onCancel }) {
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden">
+        <div className="bg-amber-600 px-6 py-4">
+          <h2 className="text-white font-bold text-base">⚠️ ไฟล์นี้เคยนำเข้าแล้ว</h2>
+          <p className="text-amber-100 text-xs mt-0.5 truncate">{filename}</p>
+        </div>
+        <div className="p-5 space-y-3 text-sm text-gray-700">
+          <p>Session #{sessionId} มีข้อมูลอยู่ <strong>{count} รายการ</strong></p>
+          <p>ต้องการทำอะไร?</p>
+          <div className="space-y-2 pt-1">
+            <button onClick={onReimport}
+              className="w-full text-left p-3 rounded-xl border-2 border-blue-500 bg-blue-50 hover:bg-blue-100 transition-colors">
+              <p className="font-semibold text-blue-700">🔄 อัพเดตข้อมูลใหม่ (แนะนำ)</p>
+              <p className="text-xs text-blue-500 mt-0.5">ลบรายการเดิมแล้ว import ใหม่ — <strong>คง category ที่จัดไว้แล้ว</strong></p>
+            </button>
+            <button onClick={onKeepOld}
+              className="w-full text-left p-3 rounded-xl border-2 border-gray-200 hover:border-gray-300 hover:bg-gray-50 transition-colors">
+              <p className="font-semibold text-gray-700">📂 โหลด session เดิม</p>
+              <p className="text-xs text-gray-400 mt-0.5">ไม่เปลี่ยนแปลงข้อมูลใด ๆ</p>
+            </button>
+          </div>
+        </div>
+        <div className="px-5 pb-5">
+          <button onClick={onCancel}
+            className="w-full py-2 text-sm rounded-xl border border-gray-200 text-gray-500 hover:bg-gray-50">
+            ยกเลิก
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
@@ -74,7 +110,8 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState(null)
   const [showRemap, setShowRemap] = useState(false)
   const [selectedBank, setSelectedBank] = useState('ktb')
-  const [pendingFile, setPendingFile] = useState(null)
+  const [pendingFile, setPendingFile] = useState(null)       // { file, bank }
+  const [reimportPrompt, setReimportPrompt] = useState(null) // { file, bank, sessionId, count }
   const fileInputRef = useRef(null)
 
   // บันทึก checkedSessionIds ลง localStorage
@@ -189,23 +226,56 @@ export default function App() {
       formData.append('file', file)
       const res = await uploadFile(formData, bank)
       const data = res.data
+
+      if (data.is_duplicate && data.can_reimport) {
+        toast.dismiss(tid)
+        setUploading(false)
+        setUploadProgress(null)
+        setReimportPrompt({ file, bank, sessionId: data.session_id, count: data.count, filename: data.filename || file.name })
+        return
+      }
+
       if (data.is_duplicate) {
         toast.success('ไฟล์นี้เคยนำเข้าแล้ว — โหลด session เดิม', { id: tid })
       } else {
         toast.success(data.message, { id: tid })
       }
-      const sessRes = await getSessions()
-      setSessions(sessRes.data)
-      if (data.session_id) {
-        setActiveSessionId(data.session_id)
-        setCheckedSessionIds(prev => new Set([...prev, data.session_id]))
-      }
+      await _afterUpload(data)
     } catch (err) {
       const msg = err.response?.data?.detail || 'นำเข้าไม่สำเร็จ'
       toast.error(msg, { id: tid })
     } finally {
       setUploading(false)
       setUploadProgress(null)
+    }
+  }
+
+  const doReimport = async (file, bank) => {
+    setUploading(true)
+    setUploadProgress('กำลัง Re-import และคืนค่า category...')
+    const tid = toast.loading(`🔄 กำลัง Re-import: ${file.name}`, { duration: Infinity })
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await reimportFile(formData, bank)
+      const data = res.data
+      toast.success(data.message, { id: tid })
+      await _afterUpload(data)
+    } catch (err) {
+      const msg = err.response?.data?.detail || 'Re-import ไม่สำเร็จ'
+      toast.error(msg, { id: tid })
+    } finally {
+      setUploading(false)
+      setUploadProgress(null)
+    }
+  }
+
+  const _afterUpload = async (data) => {
+    const sessRes = await getSessions()
+    setSessions(sessRes.data)
+    if (data.session_id) {
+      setActiveSessionId(data.session_id)
+      setCheckedSessionIds(prev => new Set([...prev, data.session_id]))
     }
   }
 
@@ -261,6 +331,26 @@ export default function App() {
             await doUpload(file, bank)
           }}
           onCancel={() => setPendingFile(null)}
+        />
+      )}
+      {reimportPrompt && (
+        <ReimportModal
+          filename={reimportPrompt.filename}
+          sessionId={reimportPrompt.sessionId}
+          count={reimportPrompt.count}
+          onReimport={async () => {
+            const { file, bank } = reimportPrompt
+            setReimportPrompt(null)
+            await doReimport(file, bank)
+          }}
+          onKeepOld={() => {
+            const { sessionId } = reimportPrompt
+            setReimportPrompt(null)
+            setActiveSessionId(sessionId)
+            setCheckedSessionIds(prev => new Set([...prev, sessionId]))
+            toast.success('โหลด session เดิมแล้ว')
+          }}
+          onCancel={() => setReimportPrompt(null)}
         />
       )}
       {showRemap && (

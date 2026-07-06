@@ -1,24 +1,20 @@
-"""
-TTB (TMBThanachart Bank) PDF Statement Parser
-
-Column layout per line:
-  DD/MM/YY  TYPE  AMOUNT  BALANCE  REF
-
-Classification: balance movement determines W/D
-  balance > prev  →  deposit
-  balance < prev  →  withdrawal
-"""
 import re
 import io
 import hashlib
 from typing import List, Optional
-from dataclasses import dataclass, field
 from pdf_parser import ParsedTransaction, ParsedStatement
 
-RE_TX  = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(\w{2,4})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+(\S+)\s*$')
-RE_BF  = re.compile(r'^BF\s+([\d,]+\.\d{2})')
-RE_ACC = re.compile(r'(\d{3}-\d{1}-\d{5}-\d{1})')       # 438-7-93990-5
-RE_PER = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(\d{4})')   # 30/06/24 0001
+# balance อาจเป็น .00 (ไม่มี digit นำหน้า) เช่น "3,500.00 .00" หรือ "11,000.00 .00"
+RE_TX = re.compile(
+    r'^(\d{2}/\d{2}/\d{2})\s+'      # date DD/MM/YY
+    r'(\w{2,4})\s+'                  # type NT/TR/CA
+    r'([\d,]+\.\d{2})\s+'            # amount
+    r'(\d[\d,]*\.\d{2}|\.\d{2})\s+' # balance — รองรับ .00-.99 (ไม่มี digit นำหน้า)
+    r'(\S+)\s*$'                     # ref
+)
+RE_BF  = re.compile(r'^BF\s+(\d[\d,]*\.\d{2}|\.\d{2})')
+RE_ACC = re.compile(r'(\d{3}-\d{1}-\d{5}-\d{1})')
+RE_PER = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(\d{4})')
 
 SKIP_PREFIXES = (
     '438 SERMTHAI', 'THB', 'นาย ', 'นาง', 'น.ส.', 'บริษัท',
@@ -60,17 +56,14 @@ def parse_ttb_pdf(file_bytes: bytes, filename: str = "statement.pdf") -> ParsedS
 
     full_text = '\n'.join(all_lines)
 
-    # Extract account number
     m = RE_ACC.search(full_text)
     if m:
         stmt.account_number = m.group(1)
 
-    # Extract account name (นาย/นาง/น.ส./บริษัท after account line)
     name_m = re.search(r'((?:นาย|นาง(?:สาว)?|น\.ส\.|บริษัท)\s+[\S ]+?)(?:\n|\r)', full_text)
     if name_m:
         stmt.account_name = name_m.group(1).strip()
 
-    # Extract period from "DD/MM/YY NNNN" page marker — use first and last occurrence
     periods = RE_PER.findall(full_text)
     if periods:
         stmt.period_start = periods[0][0]
@@ -84,7 +77,6 @@ def parse_ttb_pdf(file_bytes: bytes, filename: str = "statement.pdf") -> ParsedS
         if not line:
             continue
 
-        # BF (brought forward)
         m = RE_BF.match(line)
         if m:
             prev_bal = _n(m.group(1))
@@ -93,7 +85,6 @@ def parse_ttb_pdf(file_bytes: bytes, filename: str = "statement.pdf") -> ParsedS
         if _skip(line):
             continue
 
-        # Transaction line
         m = RE_TX.match(line)
         if not m:
             continue
@@ -102,12 +93,17 @@ def parse_ttb_pdf(file_bytes: bytes, filename: str = "statement.pdf") -> ParsedS
         amt = _n(amt_str)
         bal = _n(bal_str)
 
-        # Classify W/D by balance movement
-        is_deposit = (bal > prev_bal) if prev_bal is not None else None
+        # กรณี balance < 1 บาท และ prev_bal > 0 — ต้องเป็น withdrawal เสมอ
+        if bal < 1.0 and prev_bal is not None and prev_bal > bal:
+            is_deposit = False
+        elif prev_bal is not None:
+            is_deposit = bal > prev_bal
+        else:
+            is_deposit = None
 
         tx = ParsedTransaction(
             date=date_str,
-            particulars=tx_type,   # NT/TR/CA etc. — แสดงเป็น particulars
+            particulars=tx_type,
             via=ref,
             balance=bal,
         )
@@ -117,7 +113,7 @@ def parse_ttb_pdf(file_bytes: bytes, filename: str = "statement.pdf") -> ParsedS
         elif is_deposit is False:
             tx.withdrawal = amt
         else:
-            # ไม่มี context — เก็บ deposit ก่อน user แก้ได้ภายหลัง
+            # ไม่มี context — เก็บไว้เป็น deposit ก่อน user แก้ได้
             tx.deposit = amt
 
         prev_bal = bal

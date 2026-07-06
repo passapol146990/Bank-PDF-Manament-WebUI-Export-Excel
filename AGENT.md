@@ -4,8 +4,8 @@
 ---
 
 ## Project Overview
-Web app จัดหมวดหมู่รายการธนาคาร KTB (Krungthai Bank)
-- Upload PDF statement → parse → แสดงตาราง → จัดหมวดหมู่ → export Excel
+Web app จัดหมวดหมู่รายการธนาคาร รองรับ **KTB** และ **TTB**
+- Upload PDF/Excel/CSV/JSON → parse → ตาราง → จัดหมวดหมู่ → export Excel
 - **Single port**: FastAPI serve React build บน port 8000
 - DB: SQLite (`backend/bank_statements.db`)
 
@@ -23,25 +23,28 @@ Web app จัดหมวดหมู่รายการธนาคาร KT
 ## File Structure
 ```
 backend/
-├── main.py          # FastAPI app, all /api/* endpoints, serve React dist
-├── models.py        # UploadSession, Transaction, CategoryConfig
-├── schemas.py       # Pydantic v2 schemas
-├── crud.py          # DB operations
-├── pdf_parser.py    # KTB PDF parser (pdfplumber, balance-movement W/D logic)
-├── database.py      # SQLite engine, get_db()
+├── main.py           # FastAPI app, all /api/* endpoints, serve React dist
+├── models.py         # UploadSession, Transaction, CategoryConfig
+├── schemas.py        # Pydantic v2 schemas
+├── crud.py           # DB operations
+├── pdf_parser.py     # KTB PDF parser
+├── ttb_parser.py     # TTB PDF parser
+├── database.py       # SQLite engine, get_db(), run_migrations()
 └── requirements.txt
 
 frontend/
 ├── src/
-│   ├── App.jsx               # Main shell, session management, upload/export
-│   ├── api.js                # Axios client (baseURL: /api)
-│   ├── main.jsx              # ReactDOM entry, Toaster (duration:5000, loading:Infinity)
-│   ├── index.css             # Tailwind + .table-scroll-container sticky header fix
+│   ├── App.jsx                    # Main shell, session/upload/export
+│   ├── api.js                     # Axios client (baseURL: /api)
+│   ├── main.jsx
+│   ├── index.css
 │   └── components/
-│       ├── StatementGrid.jsx  # Table + pagination + drag-select + auto-save
-│       ├── DashboardSummary.jsx # Stats cards + Pie/Bar charts (Recharts)
-│       └── SessionList.jsx    # Uploaded files list + resume progress
-└── vite.config.js            # proxy /api → localhost:8000
+│       ├── StatementGrid.jsx      # Table, pagination, drag-select, bulk, flow edit
+│       ├── DashboardSummary.jsx   # Stats + charts
+│       ├── SessionList.jsx        # File list + checkbox toggle
+│       ├── CategoryManager.jsx    # Manage categories + keyboard shortcuts
+│       └── CategoryRemapPage.jsx  # Remap category names
+└── vite.config.js    # proxy /api → 127.0.0.1:8000
 ```
 
 ---
@@ -54,7 +57,7 @@ UploadSession: id, filename, file_hash(MD5), account_number, account_name,
 Transaction:   id, session_id(FK), date, particulars, chq_no, withdrawal,
                deposit, balance, via, category(default:Uncategorized), status(default:pending)
 
-CategoryConfig: id, name, color, description
+CategoryConfig: id, name, color, description, sort_order
 ```
 
 ---
@@ -62,122 +65,154 @@ CategoryConfig: id, name, color, description
 ## API Endpoints (all prefixed `/api`)
 ```
 GET    /health
-GET    /sessions                    → list all sessions
-DELETE /sessions/{id}               → delete session + its transactions
-GET    /transactions?session_id=X   → get transactions (up to 50000)
-PUT    /transactions/{id}           → update category/status (auto-save)
-PUT    /transactions/bulk           → bulk update {ids, category, status}
-DELETE /transactions                → delete all
+GET    /sessions
+DELETE /sessions/{id}
+
+GET    /transactions?session_id=X&session_ids=1,2,3   (multi-session support)
+PUT    /transactions/{id}           update category/status/withdrawal/deposit/balance
+PUT    /transactions/bulk           {ids, category, status, withdrawal, deposit}
+PUT    /transactions/bulk-flow      {ids, flow: "in"|"out"}
+POST   /transactions/bulk-assign    bulk by date/row range + flow_filter
 GET    /transactions/stats
 GET    /transactions/category-summary
-POST   /upload                      → upload PDF/xlsx/csv → parse → store
-GET    /export?session_id=X         → download categorized Excel
+GET    /transactions/distinct-categories
+POST   /transactions/remap-category
+
+POST   /upload?bank=ktb|ttb        PDF/xlsx/csv/json
+GET    /export?session_ids=1,2,3   multi-session export → xlsx (RFC 5987 filename)
+
 GET    /categories
 POST   /categories
+PUT    /categories/{id}
 DELETE /categories/{id}
-GET    /api/docs                    → Swagger UI
+PUT    /categories/reorder
+
+GET    /api/docs
 ```
 
 ---
 
-## PDF Parser (`pdf_parser.py`)
-- ใช้ `pdfplumber` extract text line by line
+## PDF Parsers
+
+### pdf_parser.py (KTB)
 - Pattern: `DD/MM  PARTICULARS  AMOUNT  BALANCE  VIA`
-- **W/D classification**: ใช้ balance movement (balance เพิ่ม = deposit, ลด = withdrawal) ไม่ใช้ keyword
-- Skip: header rows, B/F lines, page footers
-- Extract metadata: account_number (regex `\d{3}-\d-\d{5}-\d`), account_name, period
+- W/D: balance movement (เพิ่ม=deposit, ลด=withdrawal)
+- Extract: account_number (`\d{3}-\d-\d{5}-\d`), account_name, period
+
+### ttb_parser.py (TTB)
+- Pattern: `DD/MM/YY  TYPE  AMOUNT  BALANCE  REF`
+- TYPE: NT, TR, CA, FE etc.
+- BF line = opening balance สำหรับ classify W/D
+- W/D: balance movement เหมือน KTB
+- Extract: account_number, account_name, period
+
+### Upload flow (PDF)
+1. ผู้ใช้เลือกไฟล์ → **BankSelectModal popup** → เลือก KTB หรือ TTB → confirm
+2. POST /upload?bank=ktb|ttb
 
 ---
 
 ## Frontend Key Behaviors
 
+### Multi-session (checkedSessionIds)
+- **SessionList**: checkbox ติ๊กแต่ละ session / select all
+- transactions โหลดจากทุก session ที่ติ๊ก (`session_ids=1,2,3`)
+- export เฉพาะ session ที่ติ๊ก
+- `checkedSessionIds` บันทึกลง `localStorage` — persist หลัง refresh
+
 ### StatementGrid.jsx
-- **Pagination**: 25/50/100 rows per page, page number buttons + jump-to-page input
-- **⏭ ข้ามไปที่ยังไม่จัด**: กดเพื่อข้ามไปหน้าถัดที่มี Uncategorized row (wrap around)
-- **Drag-to-select**: left-click drag = select, right-click drag = deselect
-- **stale closure fix**: ใช้ `selectedIdsRef` sync ทุก render
-- **Auto-save**: debounce 400ms ต่อ row → PUT /api/transactions/{id}
-- **Bulk apply**: เลือกหลาย row + dropdown → PUT /api/transactions/bulk
-- **Add category**: ปุ่ม ➕ เปิด modal กรอกชื่อ+สี → POST /api/categories
-- **No sort**: รักษาลำดับเอกสารต้นฉบับ (order by id)
+- **ลำดับ #**: แสดง `(page-1)*pageSize + index + 1` ไม่ใช่ DB id
+- **เรียงวันที่**: `DD/MM/YY` หรือ `DD/MM` → sort key `YYYY-MM-DD`
+- **Drag-to-select**: left drag = select, right drag = deselect
+- **Bulk save**: `applyCategory` ส่ง `PUT /transactions/bulk` ครั้งเดียว (ไม่ใช่ทีละ id)
+- **Undo/Redo**: Ctrl+Z / Ctrl+Y, stack 50 รายการ
+- **Keyboard shortcuts**: 1-9 กำหนด category ให้ hovered/selected rows
+- **FlowEditCell**: hover → ✏️ → toggle เงินออก/เข้า + แก้ยอด (retry 3 รอบ)
+- **Bulk flow**: floating bar ปุ่ม ↑ออก/↓เข้า → PUT /bulk-flow (1 request)
+- **⚡ กำหนดช่วง Bulk**: modal 3 ขั้นตอน
+  1. ช่วงวันที่ (`DD/MM/YY`) หรือช่วงลำดับที่
+  2. ประเภทเงิน (ทั้งหมด / เข้า / ออก)
+  3. เลือกหมวดหมู่ → ยืนยัน
+- **Category ไม่ตรง DB**: แสดง badge 📌 สีส้ม + dropdown เปลี่ยนหมวดหมู่
+
+### BulkAssign date format
+- DB มีวันที่ 2 format: `DD/MM/YY` และ `DD/MM` (ไม่มีปี)
+- parse_date_key() รองรับทั้งสองโดย detect default_year จาก data จริง
 
 ### App.jsx
-- Auto-load sessions on mount, auto-select session[0]
-- Upload: PDF → loading toast (Infinity duration) → parse → switch to new session
-- Export: GET /api/export?session_id=X → download .xlsx ชื่อไฟล์ตาม PDF ต้นฉบับ
-- Session resume: คลิก SessionList item → load transactions ของ session นั้น
+- BankSelectModal: popup ก่อน upload PDF ทุกครั้ง
+- Export: RFC 5987 Content-Disposition รองรับชื่อไฟล์ภาษาไทย
 
-### Toast durations
-- success/error: 5000ms
-- loading: Infinity (ต้องปิดด้วย `toast.success(..., { id: tid })`)
-
-### Sticky header fix
-```css
-.table-scroll-container { overflow-x: auto; overflow-y: auto; max-height: 600px; }
-.table-scroll-container table { border-collapse: separate; border-spacing: 0; }
-.table-scroll-container thead th { position: sticky; top: 0; z-index: 20; box-shadow: 0 1px 0 #374151; }
+### Retry pattern
+```js
+async function retryFn(fn, max=3, delay=500) {
+  for (let i=1; i<=max; i++) {
+    try { return await fn() } catch(e) { if(i<max) await sleep(delay*i) else throw e }
+  }
+}
 ```
+ใช้กับทุก save operation — category, flow, bulk
 
 ---
 
 ## Export Excel Structure
-Sheet order (สรุปยอดรวม อยู่หน้าสุด):
-1. **สรุปยอดรวม** — account info + category summary table + grand total
-2. **รายการทั้งหมด** — all transactions, color-coded by category
-3. **โอนออกซื้อของ** — category: ซื้อของ + subtotal row
-4. **โอนออกแยกบัญชีตัวเอง** — category: โอนเงิน
-5. **จ่ายพนักงาน** — category: จ่ายพนักงาน
-6. **ลูกค้าโอนให้** — category: รายได้
-7. **ค่าสาธารณูปโภค** — category: ค่าสาธารณูปโภค
-8. **อื่นๆ** — categories: ค่าใช้จ่ายทั่วไป + Uncategorized
-9. **[custom]** — custom categories ที่ user เพิ่มเอง (auto-created)
+Sheet order (สรุปยอดรวมอยู่หน้าสุด):
+1. **สรุปยอดรวม** — account info + summary table + grand total (formula-based)
+2. **รายการทั้งหมด** — all transactions, color-coded
+3. **โอนออกซื้อของ** / **โอนออกแยกบัญชีตัวเอง** / **จ่ายพนักงาน**
+4. **ลูกค้าโอนให้** / **ค่าสาธารณูปโภค** / **อื่นๆ**
+5. **[custom sheets]** — category นอก EXPORT_SHEET_MAP
+
+Export filename: RFC 5987 (`filename*=UTF-8''...`) รองรับภาษาไทย
 
 ---
 
-## Default Categories & Colors
-| Category | Hex | Tailwind |
-|---------|-----|---------|
-| จ่ายพนักงาน | #EF4444 | red |
-| ซื้อของ | #F97316 | orange |
-| ค่าสาธารณูปโภค | #EAB308 | yellow |
-| รายได้ | #22C55E | green |
-| โอนเงิน | #3B82F6 | blue |
-| ค่าใช้จ่ายทั่วไป | #8B5CF6 | purple |
-| Uncategorized | #6B7280 | gray |
+## Default Categories
+| Category | Hex |
+|---------|-----|
+| จ่ายพนักงาน | #EF4444 |
+| ซื้อของ | #F97316 |
+| ค่าสาธารณูปโภค | #EAB308 |
+| รายได้ | #22C55E |
+| โอนเงิน | #3B82F6 |
+| ค่าใช้จ่ายทั่วไป | #8B5CF6 |
+| Uncategorized | #6B7280 |
 
 ---
 
 ## How to Run
 
 ```bash
-# Backend (first time)
+# Backend
 cd backend
 python -m venv venv
-venv\Scripts\activate          # Windows
+venv\Scripts\activate
 pip install -r requirements.txt
 
-# Frontend build (production mode)
-cd frontend
-npm install
-npm run build
+# Frontend build
+cd frontend && npm install && npm run build
 
-# Start server (single port)
-cd backend
-venv\Scripts\activate
+# Start (single port)
+cd backend && venv\Scripts\activate
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 # → http://localhost:8000
+
+# หรือ npm start (preview)
+cd frontend && npm start
 ```
 
 ```bash
-# Dev mode (2 terminals, HMR)
+# Dev mode (HMR)
 # T1: cd backend && venv\Scripts\activate && uvicorn main:app --reload --port 8000
 # T2: cd frontend && npm run dev
 # → http://localhost:5173
+# Vite proxy: /api → 127.0.0.1:8000 (ต้องใช้ 127.0.0.1 ไม่ใช่ localhost — Node 18+ IPv6 issue)
 ```
 
 ---
 
-## Known Issues / TODO
-- [ ] PDF parser รองรับเฉพาะ KTB format — ธนาคารอื่นยังไม่ได้ทดสอบ
-- [ ] ไม่มี user auth (single-user app)
-- [ ] SQLite ไม่รองรับ concurrent writes — ถ้าต้องการ production ใช้ PostgreSQL แทน
+## Known Issues / Notes
+- SQLite ไม่รองรับ concurrent writes — production ควรใช้ PostgreSQL
+- ไม่มี user auth (single-user app)
+- TTB parser รองรับ format `DD/MM/YY TYPE AMOUNT BALANCE REF` เท่านั้น
+- DB date field มีทั้ง `DD/MM/YY` และ `DD/MM` (ไม่มีปี) — parse_date_key รองรับทั้งสอง

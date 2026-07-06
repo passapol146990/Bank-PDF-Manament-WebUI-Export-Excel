@@ -60,8 +60,26 @@ class TransactionOut(TransactionBase):
 
 class BulkUpdateRequest(BaseModel):
     ids: List[int]
-    category: str
-    status: Optional[str] = "categorized"
+    category: Optional[str] = None
+    status: Optional[str] = None
+    withdrawal: Optional[float] = None
+    deposit: Optional[float] = None
+
+
+class BulkFlowUpdateRequest(BaseModel):
+    ids: List[int]
+    flow: str  # "in" | "out"
+
+
+class BulkAssignRequest(BaseModel):
+    category: Optional[str] = None
+    flow: Optional[str] = None         # เปลี่ยน flow ของรายการ: "in" | "out"
+    flow_filter: Optional[str] = None  # กรองเฉพาะ flow นี้: "in" | "out" | None=ทั้งหมด
+    session_ids: Optional[List[int]] = None
+    row_from: Optional[int] = None
+    row_to: Optional[int] = None
+    date_from: Optional[str] = None    # DD/MM/YY or DD/MM/YYYY
+    date_to: Optional[str] = None
 
 
 # ─── Category ─────────────────────────────────────────────────────────────────

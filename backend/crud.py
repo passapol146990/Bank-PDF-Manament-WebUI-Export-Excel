@@ -19,6 +19,12 @@ def get_session_by_hash(db: Session, file_hash: str):
     return db.query(models.UploadSession).filter(models.UploadSession.file_hash == file_hash).first()
 
 
+def get_session_by_filename(db: Session, filename: str):
+    return db.query(models.UploadSession).filter(
+        models.UploadSession.filename == filename
+    ).order_by(models.UploadSession.created_at.desc()).first()
+
+
 def create_session(db: Session, filename: str, file_hash: str = None,
                    account_number: str = None, account_name: str = None,
                    bank_name: str = None, period_start: str = None,
@@ -101,14 +107,48 @@ def update_transaction(db: Session, transaction_id: int, update: schemas.Transac
     return db_tx
 
 
-def bulk_update_transactions(db: Session, ids: List[int], category: str, status: str = "categorized"):
+def bulk_update_transactions(db: Session, ids: List[int], category: str = None,
+                             status: str = None, withdrawal=None, deposit=None):
+    values = {}
+    if category is not None:
+        values["category"] = category
+    if status is not None:
+        values["status"] = status
+    if withdrawal is not None:
+        values["withdrawal"] = withdrawal
+    if deposit is not None:
+        values["deposit"] = deposit
+    if not values:
+        return []
     db.query(models.Transaction).filter(
         models.Transaction.id.in_(ids)
-    ).update({"category": category, "status": status}, synchronize_session=False)
+    ).update(values, synchronize_session=False)
     db.commit()
     return db.query(models.Transaction).filter(
         models.Transaction.id.in_(ids)
     ).all()
+
+
+def bulk_update_flow(db: Session, ids: List[int], flow: str):
+    """สลับ withdrawal <-> deposit โดยย้ายยอดเงินตาม flow ที่ระบุ
+    flow='out': ยอดที่มีอยู่ (ไม่ว่าจะ dep หรือ wd) → ย้ายไป withdrawal
+    flow='in':  ยอดที่มีอยู่ → ย้ายไป deposit
+    """
+    txs = db.query(models.Transaction).filter(
+        models.Transaction.id.in_(ids)
+    ).all()
+    for tx in txs:
+        amount = tx.withdrawal if tx.withdrawal is not None else tx.deposit
+        if amount is None:
+            continue
+        if flow == "out":
+            tx.withdrawal = amount
+            tx.deposit = None
+        else:
+            tx.deposit = amount
+            tx.withdrawal = None
+    db.commit()
+    return txs
 
 
 def delete_all_transactions(db: Session):
