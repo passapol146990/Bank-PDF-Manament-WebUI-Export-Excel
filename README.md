@@ -4,7 +4,11 @@ Web app สำหรับนำเข้า PDF Bank Statement → จัดห
 
 **Tech Stack:** FastAPI + SQLAlchemy (SQLite) + pdfplumber + React (Vite) + Tailwind CSS + Recharts  
 **Single-port:** FastAPI serve React build บน port เดียว (`http://localhost:8000`)
-
+---
+<img src="1.png">
+<img src="2.png">
+<img src="3.png">
+<img src="4.png">
 ---
 
 ## ติดตั้งและรัน
@@ -31,6 +35,8 @@ source venv/bin/activate
 
 # ติดตั้ง dependencies
 pip install -r requirements.txt
+
+uvicorn main:app --reload --port 8000
 ```
 
 ### Frontend
@@ -42,38 +48,17 @@ cd frontend
 npm install
 
 # Build สำหรับ production (FastAPI จะ serve ไฟล์นี้)
-npm run build
+npm run dev
 ```
 
 ---
-
-## วิธีรัน
-
-### Production (single port — แนะนำ)
-
-Build frontend ก่อน (ทำครั้งเดียว หรือทุกครั้งที่แก้ frontend):
-
-```bash
-cd frontend && npm run build
-```
-
-รัน server:
-
-```bash
-cd backend
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # macOS/Linux
-
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
 
 เปิดที่ **http://localhost:8000**  
 API Docs: **http://localhost:8000/api/docs**
 
 ---
 
-### Development mode (HMR — แก้ code แล้วเห็นผลทันที)
-
+###  Next Starter
 Terminal 1 — Backend:
 ```bash
 cd backend
@@ -87,7 +72,22 @@ cd frontend
 npm run dev
 ```
 
-เปิดที่ **http://localhost:5173** (Vite proxy /api → port 8000 อัตโนมัติ)
+---
+
+###  Productions Build Run
+Terminal 1 — Backend:
+```bash
+cd backend
+venv\Scripts\activate
+uvicorn main:app --reload --port 8000
+```
+
+Terminal 2 — Frontend:
+```bash
+cd frontend
+npm run build
+npm start
+```
 
 ---
 
